@@ -1,0 +1,14 @@
+node_modules/
+**/.build/
+*.xcodeproj/
+DerivedData/
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.mobileprovision
+*.xcarchive/
+*.ipa
+*.xcresult/
+.DS_Store

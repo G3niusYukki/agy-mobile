@@ -1,0 +1,96 @@
+name: AgyMobile
+options:
+  bundleIdPrefix: dev.example
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    AGY_MOBILE_BUNDLE_ID: dev.example.agymobile
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+packages:
+  AgyMobileCore:
+    path: Packages/AgyMobileCore
+
+targets:
+  AgyMobileLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - AgyMobileLiveActivity
+      - AgyMobile/LiveActivity/SessionActivityAttributes.swift
+    info:
+      path: AgyMobileLiveActivity/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: Antigravity 实时活动
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(AGY_MOBILE_BUNDLE_ID).liveactivity
+        SKIP_INSTALL: YES
+        SWIFT_VERSION: "5"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+
+  AgyMobile:
+    type: application
+    platform: iOS
+    sources: [AgyMobile]
+    dependencies:
+      - package: AgyMobileCore
+      - target: AgyMobileLiveActivity
+        embed: true
+    entitlements:
+      path: AgyMobile/AgyMobile.entitlements
+    info:
+      path: AgyMobile/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: Agy Mobile
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: 扫描 Mac 端 Antigravity 网关显示的配对二维码
+        NSLocalNetworkUsageDescription: 在局域网或 Tailscale 下直连 Mac 上的 Antigravity 网关
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
+        ITSAppUsesNonExemptEncryption: false
+        NSSupportsLiveActivities: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(AGY_MOBILE_BUNDLE_ID)
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_PREVIEWS: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  AgyMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [AgyMobileTests]
+    dependencies:
+      - target: AgyMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(AGY_MOBILE_BUNDLE_ID).tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5"
+
+schemes:
+  AgyMobile:
+    build:
+      targets:
+        AgyMobile: all
+    test:
+      targets: [AgyMobileTests]
