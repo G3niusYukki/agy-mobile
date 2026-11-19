@@ -6,6 +6,7 @@
   "description": "Mac 端网关：托管 agy CLI (stream-json)，同时支持局域网/Tailscale 直连与自托管 Relay 公网穿透",
   "scripts": {
     "start": "node src/index.mjs",
+    "pair": "node scripts/pair.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

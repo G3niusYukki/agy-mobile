@@ -127,6 +127,7 @@ test("agy-gateway 直连模式：扫码配对 → E2E 加密 → 模型/模式�
       AGY_BIN: fakeAgy,
       AGY_CWD: work,
       AGY_MOBILE_GATEWAY_KEY_PATH: join(work, "gw.key"),
+      AGY_LATEST_PAIR_PATH: join(work, "latest-pair.json"),
       RELAY_URL: "",
     },
     stdio: ["ignore", "pipe", "pipe"],

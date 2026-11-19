@@ -1,6 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import WebSocket from "ws"
 
 function waitMessage(ws, pred = () => true, timeoutMs = 4000) {
@@ -18,24 +21,34 @@ function waitMessage(ws, pred = () => true, timeoutMs = 4000) {
   })
 }
 
-test("agy-relay：配对 → 密文路由 → 健康检查", async () => {
+test("agy-relay：配对 → 密文路由 → 健康检查 → 重启持久化设备令牌", async () => {
   const port = 18791
   const token = "a".repeat(64)
-  const proc = spawn("node", ["src/index.mjs"], {
-    cwd: new URL("..", import.meta.url),
-    env: { ...process.env, RELAY_PORT: String(port), GATEWAY_TOKEN: token },
-    stdio: ["ignore", "pipe", "pipe"],
-  })
-  try {
-    await new Promise((resolve, reject) => {
+  const dir = mkdtempSync(join(tmpdir(), "agy-relay-test-"))
+  const devicesPath = join(dir, "devices.json")
+
+  function startRelay() {
+    return spawn("node", ["src/index.mjs"], {
+      cwd: new URL("..", import.meta.url),
+      env: { ...process.env, RELAY_PORT: String(port), GATEWAY_TOKEN: token, DEVICES_PATH: devicesPath },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+  }
+  function waitListening(p) {
+    return new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("relay did not start")), 4000)
-      proc.stdout.on("data", (d) => {
+      p.stdout.on("data", (d) => {
         if (String(d).includes("listening")) {
           clearTimeout(t)
           resolve()
         }
       })
     })
+  }
+
+  let proc = startRelay()
+  try {
+    await waitListening(proc)
 
     const gw = new WebSocket(`ws://127.0.0.1:${port}/agy/gateway`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -66,7 +79,22 @@ test("agy-relay：配对 → 密文路由 → 健康检查", async () => {
 
     gw.close()
     phone.close()
+    await new Promise((resolve) => {
+      proc.once("exit", resolve)
+      proc.kill("SIGTERM")
+    })
+
+    // 重启 relay 后，原 deviceToken 无需重新扫码即可直接恢复连接
+    proc = startRelay()
+    await waitListening(proc)
+    const resumed = new WebSocket(`ws://127.0.0.1:${port}/agy/client`, {
+      headers: { Authorization: `Bearer ${paired.deviceToken}` },
+    })
+    const resumedPaired = await waitMessage(resumed, (m) => m.type === "paired")
+    assert.equal(resumedPaired.deviceToken, paired.deviceToken)
+    resumed.close()
   } finally {
-    proc.kill("SIGTERM")
+    try { proc.kill("SIGTERM") } catch { /* ignore */ }
+    rmSync(dir, { recursive: true, force: true })
   }
 })

@@ -2,12 +2,16 @@
 // 不解析业务内容、不落盘消息、不接触 Antigravity 凭据。
 import { createServer } from "node:http"
 import { randomBytes } from "node:crypto"
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname } from "node:path"
 import { WebSocketServer, WebSocket } from "ws"
 
 const HOST = process.env.RELAY_HOST ?? "127.0.0.1"
 const PORT = Number(process.env.RELAY_PORT ?? 8791)
 const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN ?? ""
-const PAIR_TTL_MS = 5 * 60 * 1000
+const DEVICES_PATH = process.env.DEVICES_PATH ?? ""
+const PAIR_TTL_MS = 15 * 60 * 1000
+const DEVICE_TTL_MS = 90 * 24 * 60 * 60 * 1000
 const EVENT_BACKLOG = 200
 
 if (!GATEWAY_TOKEN) {
@@ -15,8 +19,41 @@ if (!GATEWAY_TOKEN) {
   process.exit(1)
 }
 
+function loadDevices(filePath) {
+  const map = new Map()
+  if (!filePath || !existsSync(filePath)) return map
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf8"))
+    const now = Date.now()
+    for (const [token, expiresAt] of Object.entries(parsed ?? {})) {
+      if (typeof expiresAt === "number" && expiresAt > now) {
+        map.set(token, { expiresAt })
+      }
+    }
+  } catch (error) {
+    console.error(`[agy-relay] 读取设备列表失败: ${error?.message ?? error}`)
+  }
+  return map
+}
+
+function saveDevices(filePath, map) {
+  if (!filePath) return
+  try {
+    mkdirSync(dirname(filePath), { recursive: true })
+    const now = Date.now()
+    const obj = {}
+    for (const [token, info] of map.entries()) {
+      if (info.expiresAt > now) obj[token] = info.expiresAt
+    }
+    writeFileSync(filePath, JSON.stringify(obj, null, 2), { mode: 0o600 })
+    chmodSync(filePath, 0o600)
+  } catch (error) {
+    console.error(`[agy-relay] 保存设备列表失败: ${error?.message ?? error}`)
+  }
+}
+
 const pairTokens = new Map()
-const devices = new Map()
+const devices = loadDevices(DEVICES_PATH)
 let gateway = null
 let device = null
 let backlog = []
@@ -155,7 +192,8 @@ function onClientMessage(ws, msg) {
     }
     pairTokens.delete(token)
     const deviceToken = randomBytes(32).toString("hex")
-    devices.set(deviceToken, { expiresAt: Date.now() + 90 * 24 * 60 * 60 * 1000 })
+    devices.set(deviceToken, { expiresAt: Date.now() + DEVICE_TTL_MS })
+    saveDevices(DEVICES_PATH, devices)
     attachDevice(ws, deviceToken)
     if (typeof msg.pub === "string") broadcastToGateway({ type: "pair_pub", pub: msg.pub })
     return

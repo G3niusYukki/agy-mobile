@@ -1,7 +1,8 @@
 // Antigravity Mobile Mac 网关：托管 agy CLI（stream-json），
 // 同时支持「局域网 / Tailscale 零部署直连」与「自托管 Relay 公网穿透」，业务载荷全程 E2E 加密。
-import { readFileSync } from "node:fs"
-import { basename } from "node:path"
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { basename, dirname, join } from "node:path"
 import { env } from "node:process"
 import QRCode from "qrcode"
 import WebSocket from "ws"
@@ -232,11 +233,21 @@ async function handleInboundMessage(ch, msg) {
   }
 }
 
-async function printQR(label, url, ttlMinutes = 15) {
+const LATEST_PAIR_FILE = env.AGY_LATEST_PAIR_PATH ?? join(homedir(), ".gemini", "agy-mobile-latest-pair.json")
+
+async function printQR(label, url, ttlMinutes = 15, kind = "direct") {
   const qr = await QRCode.toString(url, { type: "terminal", small: true }).catch(() => "")
   console.log(`\n[iPhone · ${label}] 扫码配对（${ttlMinutes} 分钟有效）：`)
   if (qr) console.log(qr)
   console.log(url, "\n")
+  try {
+    mkdirSync(dirname(LATEST_PAIR_FILE), { recursive: true })
+    let state = {}
+    try { state = JSON.parse(readFileSync(LATEST_PAIR_FILE, "utf8")) } catch { /* ignore */ }
+    state[kind] = { label, url, qr, createdAt: Date.now(), expiresAt: Date.now() + ttlMinutes * 60 * 1000 }
+    writeFileSync(LATEST_PAIR_FILE, JSON.stringify(state, null, 2), { mode: 0o600 })
+    chmodSync(LATEST_PAIR_FILE, 0o600)
+  } catch { /* ignore */ }
 }
 
 // MARK: - 1. 局域网 / Tailscale 嵌入式直连模式
@@ -306,7 +317,7 @@ function connectRelay() {
     try { msg = JSON.parse(String(raw)) } catch { return }
     if (msg.type === "pair_token") {
       const url = `${PAIR_BASE}#${msg.token}.${gatewayPublicKey}`
-      await printQR("公网 Relay", url, 5)
+      await printQR("公网 Relay（Wi-Fi / 5G 通用）", url, 15, "relay")
       return
     }
     if (msg.type === "hello") return
@@ -339,6 +350,19 @@ function shutdown() {
   try { relaySocket?.close() } catch { /* ignore */ }
   process.exit(0)
 }
+process.on("SIGUSR1", () => {
+  if (relaySocket?.readyState === WebSocket.OPEN) {
+    relaySocket.send(JSON.stringify({ type: "pair_create" }))
+  }
+  if (localServer) {
+    const { lan, tailscale } = discoverLocalAddresses()
+    const addr = tailscale[0]?.address ?? lan[0]?.address ?? "127.0.0.1"
+    const label = tailscale[0] ? `Tailscale 直连 (${addr})` : `局域网直连 (${addr})`
+    const token = localServer.createPairToken()
+    void printQR(label, `http://${addr}:${LOCAL_PORT}/agy/pair#${token}.${gatewayPublicKey}`, 15, "direct")
+  }
+})
+
 process.on("SIGINT", shutdown)
 process.on("SIGTERM", shutdown)
 
