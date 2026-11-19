@@ -11,11 +11,13 @@ struct AgyMobileApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if !model.isPaired {
+                if model.isPaired {
+                    AgyRootView()
+                } else if let remote = model.officialRemote {
+                    OfficialRemoteHomeView(remote: remote)
+                } else {
                     PairingView()
                         .environment(\.colorScheme, .dark)
-                } else {
-                    AgyRootView()
                 }
             }
             .modifier(AppFontScope())

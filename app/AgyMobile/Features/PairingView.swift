@@ -24,7 +24,7 @@ struct PairingView: View {
                     Text("连接 Antigravity")
                         .appFont(.system(size: 30, weight: .bold))
                         .foregroundStyle(Theme.textPrimary)
-                    Text("在 Mac 运行 agy-mobile gateway，扫描终端里的二维码，支持局域网 / Tailscale 直连或自托管公网 Relay。")
+                    Text("直接扫描 Antigravity 桌面端「Remote Control」二维码，或扫描自建网关二维码（原生界面 · 支持局域网 / Tailscale 直连与公网 Relay）。")
                         .appFont(.subheadline)
                         .foregroundStyle(Theme.textSecondary)
                         .multilineTextAlignment(.center)
@@ -49,7 +49,7 @@ struct PairingView: View {
                         .buttonStyle(bouncy())
 
                         HStack(spacing: 10) {
-                            TextField("粘贴配对链接（直连或 HTTPS 中继）", text: $token)
+                            TextField("粘贴官方远程链接或网关配对链接", text: $token)
                                 .textFieldStyle(.plain)
                                 .foregroundStyle(Theme.textPrimary)
                                 .autocapitalization(.none)
@@ -155,7 +155,7 @@ struct PairScanner: View {
                     }
                 }
                 Spacer()
-                Text("把 Mac 终端里的直连或 Relay 二维码放进框内；也可返回手动粘贴配对链接。")
+                Text("支持扫描桌面端 Antigravity 官方 Remote Control 二维码，或 agy-mobile 网关二维码。")
                     .appFont(.footnote)
                     .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)

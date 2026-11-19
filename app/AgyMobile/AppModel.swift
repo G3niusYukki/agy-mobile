@@ -42,6 +42,10 @@ final class AppModel: ObservableObject {
         return ["配对", "密钥", "加密", "not paired"].contains { message.localizedCaseInsensitiveContains($0) }
     }
     @Published private(set) var isPaired = false
+    @Published private(set) var officialRemote: OfficialRemoteLink?
+    @Published var shouldPresentOfficialRemote = false
+
+    private static let officialRemoteStorageKey = "agy-mobile.officialRemote.v1"
 
     var canChangeSettings: Bool { isConnected && conversation.canSend && !recoveringSetting && queuedSession == nil }
 
@@ -125,6 +129,7 @@ final class AppModel: ObservableObject {
         self.client = client
         self.rpcTimeout = rpcTimeout
         isPaired = client.hasPairing
+        officialRemote = Self.loadOfficialRemote()
         transportKind = client.transportKind
         endpointHost = client.endpointHost
         conversationID = conversation.conversationID
@@ -181,9 +186,32 @@ final class AppModel: ObservableObject {
 
     func pair(token: String) {
         clearError()
+        if let official = OfficialRemoteLink(token) {
+            saveOfficialRemote(official)
+            shouldPresentOfficialRemote = true
+            return
+        }
         client.pair(token: token)
         transportKind = client.transportKind
         endpointHost = client.endpointHost
+    }
+
+    func clearOfficialRemote() {
+        officialRemote = nil
+        shouldPresentOfficialRemote = false
+        UserDefaults.standard.removeObject(forKey: Self.officialRemoteStorageKey)
+    }
+
+    private func saveOfficialRemote(_ link: OfficialRemoteLink) {
+        officialRemote = link
+        if let data = try? JSONEncoder().encode(link) {
+            UserDefaults.standard.set(data, forKey: Self.officialRemoteStorageKey)
+        }
+    }
+
+    private static func loadOfficialRemote() -> OfficialRemoteLink? {
+        guard let data = UserDefaults.standard.data(forKey: officialRemoteStorageKey) else { return nil }
+        return try? JSONDecoder().decode(OfficialRemoteLink.self, from: data)
     }
 
     func resetPairing() {
