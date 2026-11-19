@@ -16,7 +16,7 @@ struct PairingView: View {
                     Spacer(minLength: 40)
                     ZStack {
                         Circle()
-                            .fill(Theme.indigo.opacity(0.28))
+                            .fill(Color.white.opacity(0.10))
                             .frame(width: 108, height: 108)
                             .blur(radius: 18)
                         AgyMark(size: 76)
@@ -41,10 +41,10 @@ struct PairingView: View {
                                 Text("扫描配对二维码")
                                     .appFont(.headline)
                             }
-                            .foregroundStyle(.white)
+                            .foregroundStyle(Theme.onAccent)
                             .frame(maxWidth: .infinity)
                             .frame(height: 54)
-                            .background(Theme.accentGradient, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .background(Theme.accent, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                         }
                         .buttonStyle(bouncy())
 
@@ -65,7 +65,7 @@ struct PairingView: View {
                             .foregroundStyle(Theme.textPrimary)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 12)
-                            .agyGlassCard(radius: 16, tint: Theme.indigo.opacity(0.32), interactive: true)
+                            .agyGlassCard(radius: 16, interactive: true)
                             .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                     }

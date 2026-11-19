@@ -7,7 +7,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import WebSocket from "ws"
-import { parseAgyModelsOutput } from "../src/agy-runner.mjs"
+import { AgyRunner, parseAgyModelsOutput } from "../src/agy-runner.mjs"
 import { extractUserRequestText, readSessionHistoryStrict } from "../src/history.mjs"
 import { listSessionCatalog } from "../src/session-catalog.mjs"
 
@@ -37,8 +37,8 @@ function makeClientE2E(gatewayPubBase64url) {
   }
 }
 
-test("parseAgyModelsOutput 解析模型与厂商", () => {
-  const raw = "\r\x1b[2K⠋ Fetching available models...\ngemini-4-neon-xhigh       Gemini 4 Neon (XHigh)\nclaude-opus-5-5-high      Claude Opus 5.5 (High)\ngpt-oss-120b-medium       GPT-OSS 120B (Medium)\n"
+test("parseAgyModelsOutput 解析空格与制表符分隔的模型列表", () => {
+  const raw = "gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)\nclaude-opus-5-5-high      Claude Opus 5.5 (High)\ngpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n"
   const models = parseAgyModelsOutput(raw)
   assert.equal(models.length, 3)
   assert.deepEqual(models.map((m) => [m.provider, m.id, m.displayName]), [
@@ -85,6 +85,10 @@ test("session-catalog 与 history 正确解析 Antigravity SQLite 与 transcript
     ].join("\n"))
 
     assert.equal(extractUserRequestText("<USER_REQUEST>\n你好\n</USER_REQUEST>"), "你好")
+    assert.equal(
+      extractUserRequestText("<USER_REQUEST>\n<DESKTOP_CONTINUATION_CONTEXT>\n旧上下文\n</DESKTOP_CONTINUATION_CONTEXT>\n\n继续分析\n</USER_REQUEST>"),
+      "继续分析"
+    )
 
     const catalog = await listSessionCatalog([root])
     assert.equal(catalog.length, 1)
@@ -207,6 +211,78 @@ test("agy-gateway 直连模式：扫码配对 → E2E 加密 → 模型/模式�
     ws.close()
   } finally {
     proc.kill("SIGTERM")
+    rmSync(work, { recursive: true, force: true })
+  }
+})
+
+test("AgyRunner 切入桌面端会话时自动注入近期上下文且不触发 trajectory not found", async () => {
+  const work = mkdtempSync(join(tmpdir(), "agy-desktop-branch-"))
+  const desktopDir = join(work, "antigravity")
+  const cliDir = join(work, "antigravity-cli")
+  const desktopId = "a761132b-365b-4c7e-ab7c-4530f56fd313"
+  const fakeAgy = new URL("./fake-agy.mjs", import.meta.url).pathname
+  chmodSync(fakeAgy, 0o755)
+
+  const prevCliEnv = process.env.FAKE_AGY_CLI_DIR
+  process.env.FAKE_AGY_CLI_DIR = cliDir
+  try {
+    mkdirSync(join(cliDir, "conversations"), { recursive: true })
+    const logsDir = join(desktopDir, "brain", desktopId, ".system_generated", "logs")
+    mkdirSync(logsDir, { recursive: true })
+    writeFileSync(join(logsDir, "transcript_full.jsonl"), [
+      JSON.stringify({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", content: "<USER_REQUEST>\n分析 iOS UI 配色\n</USER_REQUEST>" }),
+      JSON.stringify({ step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", content: "建议改为极简曜石/钛银单色。" }),
+    ].join("\n"))
+
+    const events = []
+    let settleResolve
+    let settled = new Promise((r) => { settleResolve = r })
+
+    const runner = new AgyRunner({
+      agyBin: fakeAgy,
+      cwd: work,
+      dataDirs: [cliDir, desktopDir],
+      cliDataDir: cliDir,
+      onEvent(ev) {
+        events.push(ev)
+        if (ev.type === "agent_settled") settleResolve()
+      },
+    })
+
+    await runner.switchSession(desktopId)
+    assert.equal(runner.conversationId, desktopId)
+    assert.equal(runner.cliConversationId, null)
+
+    runner.sendPrompt({ message: "现在帮我构建并安装" })
+    await settled
+
+    const reply1 = events.find((e) => e.type === "message_end")
+    assert.ok(reply1, "应收到第一轮回复")
+    assert.equal(reply1.sessionPath, desktopId)
+    assert.doesNotMatch(reply1.message.content[0].text, /trajectory not found/)
+    assert.match(reply1.message.content[0].text, /DESKTOP_CONTINUATION_CONTEXT/)
+    assert.match(reply1.message.content[0].text, /分析 iOS UI 配色/)
+    assert.match(reply1.message.content[0].text, /现在帮我构建并安装/)
+
+    // 分支关联已建立，后续发言应直接复用 CLI 轨迹且不再重复注入上下文
+    const linkedId = runner.getLinkedCliSession(desktopId)
+    assert.equal(linkedId, "11111111-2222-4333-8444-555555555555")
+
+    events.length = 0
+    settled = new Promise((r) => { settleResolve = r })
+    runner.sendPrompt({ message: "第二轮追问" })
+    await settled
+
+    const reply2 = events.find((e) => e.type === "message_end")
+    assert.ok(reply2, "应收到第二轮回复")
+    assert.equal(reply2.sessionPath, desktopId)
+    assert.doesNotMatch(reply2.message.content[0].text, /DESKTOP_CONTINUATION_CONTEXT/)
+    assert.match(reply2.message.content[0].text, /第二轮追问/)
+
+    runner.shutdown()
+  } finally {
+    if (prevCliEnv === undefined) delete process.env.FAKE_AGY_CLI_DIR
+    else process.env.FAKE_AGY_CLI_DIR = prevCliEnv
     rmSync(work, { recursive: true, force: true })
   }
 })

@@ -83,10 +83,10 @@ struct OfficialRemoteHomeView: View {
                                     Text("打开 Remote Control")
                                         .appFont(.headline)
                                 }
-                                .foregroundStyle(.white)
+                                .foregroundStyle(Theme.onAccent)
                                 .frame(maxWidth: .infinity)
                                 .frame(height: 52)
-                                .background(Theme.accentGradient, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .background(Theme.accent, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                             }
                             .buttonStyle(bouncy())
                         }

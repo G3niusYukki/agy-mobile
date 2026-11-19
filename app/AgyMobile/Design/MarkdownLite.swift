@@ -12,6 +12,11 @@ struct MarkdownLiteText: View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
+                case .divider:
+                    Rectangle()
+                        .fill(Theme.cardStroke)
+                        .frame(height: 0.75)
+                        .padding(.vertical, 4)
                 case .codeBlock(let code, let lang):
                     CodeBlockView(code: code, lang: lang)
                 case .heading(let text):
@@ -22,7 +27,7 @@ struct MarkdownLiteText: View {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("\(n).")
                             .appFont(.system(size: 15, weight: .semibold, design: .rounded))
-                            .foregroundStyle(Theme.indigo)
+                            .foregroundStyle(Theme.textSecondary)
                             .frame(minWidth: 20, alignment: .trailing)
                         Text(inline(text))
                             .foregroundStyle(Theme.textPrimary)
@@ -75,8 +80,8 @@ struct MarkdownLiteText: View {
                     var run = AttributedString(code)
                     run.font = AppFont.system(size: 13.5, weight: .medium, design: .monospaced)
                         .resolved(scale: CGFloat(AppFontScale.effective(fontScale, followsSystem: fontFollowsSystem)))
-                    run.foregroundColor = Theme.indigo
-                    run.backgroundColor = Theme.cardStroke
+                    run.foregroundColor = Theme.textPrimary
+                    run.backgroundColor = Theme.cardFillStrong
                     out += run
                     i = text.index(after: end)
                     continue
@@ -108,6 +113,7 @@ struct MarkdownLiteText: View {
         case bullet(String)
         case heading(String)
         case codeBlock(String, String?)
+        case divider
     }
 
     private final class BlocksBox: NSObject {
@@ -163,6 +169,13 @@ struct MarkdownLiteText: View {
 
             if trimmed.isEmpty {
                 flushParagraph()
+                idx += 1
+                continue
+            }
+
+            if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                flushParagraph()
+                result.append(.divider)
                 idx += 1
                 continue
             }

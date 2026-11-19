@@ -5,7 +5,7 @@ import { homedir, networkInterfaces } from "node:os"
 import { dirname, join } from "node:path"
 import { WebSocketServer, WebSocket } from "ws"
 
-const PAIR_TTL_MS = 5 * 60 * 1000
+const PAIR_TTL_MS = 15 * 60 * 1000
 const DEVICE_TTL_MS = 90 * 24 * 60 * 60 * 1000
 
 function isTailscaleIPv4(ip) {

@@ -102,6 +102,22 @@ async function handleRPC(ch, command, fallbackId) {
     }
     if (type === "session_history") {
       const data = readSessionHistoryStrict(command.sessionPath, DATA_DIRS, { anchorId: command.anchorId })
+      const linkedCliId = runner.getLinkedCliSession(command.sessionPath)
+      if (linkedCliId && linkedCliId !== command.sessionPath) {
+        try {
+          const branchHistory = readSessionHistoryStrict(linkedCliId, DATA_DIRS)
+          if (branchHistory.messages.length > 0) {
+            const appended = branchHistory.messages.map((m) => ({
+              ...m,
+              id: `branch-${m.id}`,
+              toolCallId: m.toolCallId ? `branch-${m.toolCallId}` : undefined,
+            }))
+            data.messages = [...data.messages, ...appended]
+          }
+        } catch {
+          // CLI 分支刚启动尚未落盘日志时忽略
+        }
+      }
       sendReply(ch, { id, success: true, data })
       return
     }
@@ -216,9 +232,9 @@ async function handleInboundMessage(ch, msg) {
   }
 }
 
-async function printQR(label, url) {
+async function printQR(label, url, ttlMinutes = 15) {
   const qr = await QRCode.toString(url, { type: "terminal", small: true }).catch(() => "")
-  console.log(`\n[iPhone · ${label}] 扫码配对（5 分钟有效）：`)
+  console.log(`\n[iPhone · ${label}] 扫码配对（${ttlMinutes} 分钟有效）：`)
   if (qr) console.log(qr)
   console.log(url, "\n")
 }
@@ -251,11 +267,13 @@ async function startLocalDirect() {
   const { lan, tailscale } = discoverLocalAddresses()
   if (tailscale.length > 0) {
     const token = localServer.createPairToken()
-    await printQR(`Tailscale 直连 (${tailscale[0].address})`, `http://${tailscale[0].address}:${boundPort}/agy/pair#${token}.${gatewayPublicKey}`)
+    await printQR(`Tailscale 直连（Wi-Fi / 5G 通用 · ${tailscale[0].address}）`, `http://${tailscale[0].address}:${boundPort}/agy/pair#${token}.${gatewayPublicKey}`)
+  } else {
+    console.log("[提示] 未检测到已启动的 Tailscale（100.x.y.z）。如需用 5G 流量直连 Mac，可先在 Mac 和手机开启 Tailscale，或配置 VPS RELAY_URL。")
   }
   if (lan.length > 0) {
     const token = localServer.createPairToken()
-    await printQR(`局域网直连 (${lan[0].address})`, `http://${lan[0].address}:${boundPort}/agy/pair#${token}.${gatewayPublicKey}`)
+    await printQR(`局域网直连（同 Wi-Fi · ${lan[0].address}）`, `http://${lan[0].address}:${boundPort}/agy/pair#${token}.${gatewayPublicKey}`)
   }
   if (lan.length === 0 && tailscale.length === 0) {
     const token = localServer.createPairToken()
@@ -288,7 +306,7 @@ function connectRelay() {
     try { msg = JSON.parse(String(raw)) } catch { return }
     if (msg.type === "pair_token") {
       const url = `${PAIR_BASE}#${msg.token}.${gatewayPublicKey}`
-      await printQR("公网 Relay", url)
+      await printQR("公网 Relay", url, 5)
       return
     }
     if (msg.type === "hello") return

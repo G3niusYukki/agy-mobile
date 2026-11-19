@@ -138,7 +138,7 @@ struct ConversationTimeline<Content: View>: View {
                         .foregroundStyle(Theme.textPrimary)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                        .agyGlassCard(radius: 22, tint: Theme.indigo.opacity(0.20), interactive: true)
+                        .agyGlassCard(radius: 22, interactive: true)
                     }
                     .buttonStyle(bouncy())
                     .padding(16)

@@ -283,7 +283,7 @@ private struct AgyFontSizeSettingsView: View {
     }
 
     private var bubbleColor: Color {
-        colorScheme == .dark ? Theme.indigo.opacity(0.24) : Theme.indigo.opacity(0.11)
+        colorScheme == .dark ? Color.white.opacity(0.095) : Color(uiColor: .tertiarySystemGroupedBackground)
     }
 
     private var fontSizeTitle: String {

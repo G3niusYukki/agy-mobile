@@ -237,9 +237,12 @@ struct ConversationScreen: View {
                     if model.connection == .connecting {
                         AgyShimmerText(text: "正在连接 Mac…", font: .caption.weight(.medium))
                     } else {
-                        Text("未连接到 Mac")
+                        Text(model.isLocalLanEndpoint
+                             ? "未连接到 Mac（当前为局域网直连，用流量请开 Tailscale 或改用公网 Relay）"
+                             : "未连接到 Mac")
                             .appFont(.caption.weight(.medium))
                             .foregroundStyle(Theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
                     if model.connection != .connecting {
@@ -452,7 +455,7 @@ struct ConversationScreen: View {
 
                 Image(systemName: showsStopButton ? "stop.fill" : "arrow.up")
                     .appFont(.system(size: showsStopButton ? 12.5 : 15.5, weight: .bold))
-                    .foregroundStyle(actionEnabled ? .white : Color.secondary)
+                    .foregroundStyle(actionEnabled ? Theme.onAccent : Color.secondary)
                     .contentTransition(.symbolEffect(.replace.downUp))
             }
             .scaleEffect(actionEnabled ? 1.0 : 0.92)
@@ -599,7 +602,7 @@ private struct MessageBubble: View {
     @Environment(\.colorScheme) private var colorScheme
 
     private var userBubbleFill: Color {
-        colorScheme == .dark ? Theme.indigo.opacity(0.24) : Theme.indigo.opacity(0.10)
+        colorScheme == .dark ? Color.white.opacity(0.095) : Color(uiColor: .secondarySystemBackground)
     }
 
     var body: some View {
@@ -704,10 +707,10 @@ private struct ApprovalCard: View {
                 Button { answer(true) } label: {
                     Text("允许")
                         .appFont(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(Theme.onAccent)
                         .frame(maxWidth: .infinity)
                         .frame(minHeight: 42)
-                        .background(Theme.accentGradient, in: Capsule())
+                        .background(Theme.accent, in: Capsule())
                 }
                 .buttonStyle(bouncy())
             }

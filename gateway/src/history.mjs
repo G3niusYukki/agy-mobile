@@ -10,8 +10,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export function extractUserRequestText(raw) {
   const text = String(raw ?? "")
   const match = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(text)
-  if (match) return match[1].trim()
-  return text.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, "").trim()
+  const extracted = match
+    ? match[1]
+    : text.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, "")
+  return extracted
+    .replace(/<DESKTOP_CONTINUATION_CONTEXT>[\s\S]*?<\/DESKTOP_CONTINUATION_CONTEXT>\s*/g, "")
+    .trim()
 }
 
 function summarizeToolArgs(args) {

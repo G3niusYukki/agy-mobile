@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // Deterministic fake `agy` CLI implementing `models` and `--input-format stream-json --output-format stream-json`.
+import { existsSync } from "node:fs"
+import { join } from "node:path"
 import { createInterface } from "node:readline"
 
 const args = process.argv.slice(2)
@@ -15,9 +17,17 @@ function flagValue(name) {
   return idx >= 0 && idx + 1 < args.length ? args[idx + 1] : null
 }
 
-const conversationId = flagValue("--conversation") ?? "11111111-2222-4333-8444-555555555555"
+const requestedConversation = flagValue("--conversation")
+const conversationId = requestedConversation ?? "11111111-2222-4333-8444-555555555555"
 const model = flagValue("--model") ?? "gemini-4-neon-high"
 const mode = flagValue("--mode") ?? "default"
+
+const cliDir = process.env.FAKE_AGY_CLI_DIR
+const missingTrajectory = Boolean(
+  requestedConversation &&
+  cliDir &&
+  !existsSync(join(cliDir, "conversations", `${requestedConversation}.db`))
+)
 
 console.log(JSON.stringify({
   event: "init",
@@ -36,6 +46,18 @@ rl.on("line", (line) => {
   try { payload = JSON.parse(trimmed) } catch { return }
   const content = String(payload?.message?.content ?? "")
   turns += 1
+
+  if (missingTrajectory) {
+    console.log(JSON.stringify({
+      event: "result",
+      result: {
+        conversation_id: conversationId,
+        status: "ERROR",
+        error: `failed to send message: not_found: trajectory not found: ${conversationId}: not found`,
+      },
+    }))
+    return
+  }
 
   const userStep = stepIndex++
   console.log(JSON.stringify({

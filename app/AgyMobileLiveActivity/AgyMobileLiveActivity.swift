@@ -161,12 +161,26 @@ private struct AgyBadge: View {
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.26, style: .continuous)
                 .fill(.white)
-            Image(systemName: "sparkles")
-                .font(.system(size: size * 0.60, weight: .black))
-                .foregroundStyle(.black)
-                .offset(y: -size * 0.02)
+            AgyLiveChevronShape()
+                .fill(.black)
+                .frame(width: size * 0.50, height: size * 0.56)
+                .offset(y: -size * 0.01)
         }
         .frame(width: size, height: size)
+    }
+}
+
+private struct AgyLiveChevronShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.maxX * 0.82, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.midX, y: rect.height * 0.62))
+        p.addLine(to: CGPoint(x: rect.maxX * 0.18, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        p.closeSubpath()
+        return p
     }
 }
 

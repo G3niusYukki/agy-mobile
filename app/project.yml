@@ -9,7 +9,7 @@ settings:
   base:
     AGY_MOBILE_BUNDLE_ID: dev.example.agymobile
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "2"
+    CURRENT_PROJECT_VERSION: "3"
 
 packages:
   AgyMobileCore:

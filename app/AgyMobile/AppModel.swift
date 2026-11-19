@@ -162,6 +162,14 @@ final class AppModel: ObservableObject {
 
     var isConnected: Bool { connection == .paired || connection == .running }
 
+    var isLocalLanEndpoint: Bool {
+        guard let host = endpointHost?.lowercased() else { return false }
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4 else { return host.hasSuffix(".local") }
+        let (a, b) = (octets[0], octets[1])
+        return a == 10 || (a == 192 && b == 168) || (a == 172 && (16...31).contains(b))
+    }
+
     func bootstrap() {
         if ProcessInfo.processInfo.environment["AGY_MOBILE_RESET_PAIRING"] == "1" {
             resetPairing()

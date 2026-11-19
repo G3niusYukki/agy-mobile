@@ -4,14 +4,15 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
+import { readSessionHistoryStrict } from "./history.mjs"
 import { defaultDataDirs, resolveWorkspaceForSession } from "./session-catalog.mjs"
 
 const execFileAsync = promisify(execFile)
-const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\r/g
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
 const EFFORT_SUFFIX_RE = /-(low|medium|high|xhigh|max)$/i
 
 function stripAnsi(text) {
-  return String(text ?? "").replace(ANSI_RE, "")
+  return String(text ?? "").replace(ANSI_RE, "").replace(/\r/g, "\n")
 }
 
 export function inferProvider(modelId) {
@@ -29,7 +30,7 @@ export function parseAgyModelsOutput(raw) {
   for (const line of clean.split(/\n/)) {
     const trimmed = line.trim()
     if (!trimmed || trimmed.startsWith("Fetching ") || trimmed.startsWith("Available ")) continue
-    const match = /^([a-z0-9][a-z0-9._-]+)\s{2,}(.+)$/i.exec(trimmed)
+    const match = /^([a-z0-9][a-z0-9._-]+)(?:\t+|\s{2,})(.+)$/i.exec(trimmed)
     if (!match) continue
     const modelId = match[1].trim()
     const displayName = match[2].trim()
@@ -67,6 +68,7 @@ export class AgyRunner {
     this.defaultCwd = options.cwd ?? process.env.AGY_CWD ?? process.cwd()
     this.currentCwd = this.defaultCwd
     this.dataDirs = options.dataDirs ?? defaultDataDirs()
+    this.cliDataDir = options.cliDataDir ?? join(homedir(), ".gemini", "antigravity-cli")
     this.uploadDir = options.uploadDir ?? join(homedir(), ".gemini", "agy-mobile-uploads")
     this.sandbox = options.sandbox ?? (process.env.AGY_SANDBOX === "1")
     this.skipPermissions = options.skipPermissions ?? (process.env.AGY_SKIP_PERMISSIONS === "1")
@@ -75,7 +77,10 @@ export class AgyRunner {
     this.onEvent = options.onEvent ?? (() => {})
     this.onStatus = options.onStatus ?? (() => {})
 
-    this.conversationId = null
+    this.conversationId = null          // 手机侧展示的当前会话 ID（可能是桌面端会话，也可能是 CLI 会话）
+    this.cliConversationId = null       // agy CLI 实际可 --conversation 续接的轨迹 ID
+    this.pendingDesktopContextId = null // 若切入了桌面端会话，首次发言时自动注入近期上下文无缝续聊
+    this.branchedSessions = new Map()   // desktopId -> linked cliConversationId
     this.selectedModel = options.model ?? process.env.AGY_MODEL ?? ""
     this.thinkingLevel = options.effort ?? process.env.AGY_EFFORT ?? "high"
     this.mode = options.mode ?? process.env.AGY_MODE ?? "default"
@@ -90,9 +95,19 @@ export class AgyRunner {
     this.shuttingDown = false
   }
 
+  hasCliTrajectory(id) {
+    if (!id) return false
+    return existsSync(join(this.cliDataDir, "conversations", `${id}.db`))
+  }
+
+  getLinkedCliSession(desktopId) {
+    if (!desktopId) return null
+    return this.branchedSessions.get(desktopId) ?? null
+  }
+
   configKey() {
     return JSON.stringify([
-      this.conversationId ?? "",
+      this.cliConversationId ?? "",
       this.currentCwd,
       this.selectedModel,
       this.thinkingLevel,
@@ -184,6 +199,8 @@ export class AgyRunner {
   async newSession() {
     this.stopChild()
     this.conversationId = null
+    this.cliConversationId = null
+    this.pendingDesktopContextId = null
     this.currentCwd = this.defaultCwd
     this.isRunning = false
     this.pendingTurns = 0
@@ -197,6 +214,17 @@ export class AgyRunner {
     if (!id) throw new Error("缺少会话 ID")
     this.stopChild()
     this.conversationId = id
+    if (this.hasCliTrajectory(id)) {
+      this.cliConversationId = id
+      this.pendingDesktopContextId = null
+    } else if (this.branchedSessions.has(id)) {
+      this.cliConversationId = this.branchedSessions.get(id)
+      this.pendingDesktopContextId = null
+    } else {
+      // Antigravity 桌面端会话不存储在 antigravity-cli/conversations 下，首次回复时自动无缝续接上下文。
+      this.cliConversationId = null
+      this.pendingDesktopContextId = id
+    }
     this.isRunning = false
     this.pendingTurns = 0
     this.activeAssistantSteps.clear()
@@ -204,6 +232,22 @@ export class AgyRunner {
     this.currentCwd = workspace && existsSync(workspace) ? workspace : this.defaultCwd
     this.onStatus("idle")
     return { cancelled: false, sessionPath: id, cwd: this.currentCwd }
+  }
+
+  buildDesktopContinuationContext(desktopId) {
+    try {
+      const history = readSessionHistoryStrict(desktopId, this.dataDirs)
+      const recent = history.messages
+        .filter((m) => (m.role === "user" || m.role === "assistant") && m.text)
+        .slice(-8)
+      if (recent.length === 0) return ""
+      const excerpt = recent
+        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text.slice(0, 1200)}`)
+        .join("\n\n")
+      return `<DESKTOP_CONTINUATION_CONTEXT>\n以下是用户在 Antigravity 桌面端该会话中的最近对话上下文，请在此基础上无缝继续回复：\n${excerpt}\n</DESKTOP_CONTINUATION_CONTEXT>\n\n`
+    } catch {
+      return ""
+    }
   }
 
   stageImages(images) {
@@ -229,7 +273,7 @@ export class AgyRunner {
     }
 
     const args = ["--input-format", "stream-json", "--output-format", "stream-json"]
-    if (this.conversationId) args.push("--conversation", this.conversationId)
+    if (this.cliConversationId) args.push("--conversation", this.cliConversationId)
     if (this.selectedModel) args.push("--model", this.selectedModel)
     if (this.thinkingLevel && (!this.selectedModel || !EFFORT_SUFFIX_RE.test(this.selectedModel))) {
       args.push("--effort", this.thinkingLevel)
@@ -303,15 +347,23 @@ export class AgyRunner {
     this.onStatus("idle")
   }
 
+  recordCliConversationId(cliId) {
+    if (typeof cliId !== "string" || !cliId) return
+    this.cliConversationId = cliId
+    if (!this.conversationId) {
+      this.conversationId = cliId
+    } else if (this.conversationId !== cliId) {
+      this.branchedSessions.set(this.conversationId, cliId)
+    }
+    this.childConfigKey = this.configKey()
+  }
+
   handleAgyEvent(record) {
     if (!record || typeof record !== "object") return
     const eventType = record.event
 
     if (eventType === "init") {
-      if (typeof record.conversation_id === "string" && record.conversation_id) {
-        this.conversationId = record.conversation_id
-        this.childConfigKey = this.configKey()
-      }
+      this.recordCliConversationId(record.conversation_id)
       if (typeof record.init?.model === "string" && record.init.model) {
         this.selectedModel = record.init.model
       }
@@ -320,9 +372,7 @@ export class AgyRunner {
 
     if (eventType === "step_update" && record.step_update) {
       const update = record.step_update
-      if (typeof update.conversation_id === "string" && update.conversation_id) {
-        this.conversationId = update.conversation_id
-      }
+      this.recordCliConversationId(update.conversation_id)
       const sessionPath = this.conversationId
       const stepIndex = update.step_index ?? 0
       const stepType = update.step_type
@@ -401,10 +451,7 @@ export class AgyRunner {
 
     if (eventType === "result" && record.result) {
       const res = record.result
-      if (typeof res.conversation_id === "string" && res.conversation_id) {
-        this.conversationId = res.conversation_id
-        this.childConfigKey = this.configKey()
-      }
+      this.recordCliConversationId(res.conversation_id)
       const sessionPath = this.conversationId
       const responseText = typeof res.response === "string" ? res.response.trimEnd() : ""
       if (responseText && this.activeAssistantSteps.size > 0) {
@@ -441,6 +488,11 @@ export class AgyRunner {
     if (stagedPaths.length > 0) {
       const prefix = stagedPaths.map((p) => `[已附加图片，请用 view_file 查看: ${p}]`).join("\n")
       content = content ? `${prefix}\n\n${content}` : prefix
+    }
+    if (this.pendingDesktopContextId) {
+      const ctx = this.buildDesktopContinuationContext(this.pendingDesktopContextId)
+      this.pendingDesktopContextId = null
+      if (ctx) content = `${ctx}${content}`
     }
 
     const wasRunning = this.isRunning
