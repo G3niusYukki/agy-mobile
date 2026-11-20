@@ -12,6 +12,8 @@ final class AppModel: ObservableObject {
     @Published var selectedModel = ""
     @Published var thinking = "high"
     @Published var agentMode: AgentMode = .default
+    @Published private(set) var reconnectPhase: ReconnectPhase = .none
+    @Published private(set) var hasConnectedOnce = false
     @Published private(set) var transportKind: ConnectionTransportKind?
     @Published private(set) var endpointHost: String?
     @Published private var connectionError: String?
@@ -26,17 +28,52 @@ final class AppModel: ObservableObject {
     }
     var pendingDeliveryNotice: String? { isConnected && failureMessage == nil ? unconfirmedPromptNotice : nil }
     var errorMessage: String? { failureMessage ?? pendingDeliveryNotice }
+    var isSilentlyReconnecting: Bool { reconnectPhase == .silentGrace }
+    var isReconnectingAfterGrace: Bool {
+        reconnectPhase == .retryingGentle || reconnectPhase == .gatewayOfflineGentle
+    }
+    var gentleReconnectMessage: String? {
+        switch reconnectPhase {
+        case .gatewayOfflineGentle:
+            return "Mac 网关暂未在线，正在等待恢复…"
+        case .retryingGentle:
+            return isLocalLanEndpoint
+                ? "正在重连 Mac…（局域网直连，切换流量请开启 Tailscale）"
+                : "连接暂时断开，正在持续重连 Mac…"
+        case .none, .silentGrace:
+            return nil
+        }
+    }
     @Published var showConversation = false
     @Published var focusComposer = false
     @Published var draft = ""
     /// Advances on local sends, including photos and follow-ups during a run.
     @Published private(set) var submittedPromptID: String?
     @Published var sessions: [[String: Any]] = []
+    @Published var workspaces: [AgyWorkspaceOption] = []
+    @Published var currentCwd: String?
+    @Published var defaultCwd: String?
+    @Published private(set) var isLoadingWorkspaces = false
     @Published var selectedSessionPath: String?
     @Published var selectedSessionTitle: String?
     @Published var isLoadingHistory = false
     @Published private(set) var conversationID = UUID()
     @Published private(set) var canSend = false
+    var effectiveWorkspaces: [AgyWorkspaceOption] {
+        workspaces.isEmpty
+            ? AgyWorkspaceOption.fallback(fromSessions: sessions, currentCwd: currentCwd, defaultCwd: defaultCwd)
+            : workspaces
+    }
+    var currentWorkspaceName: String? {
+        guard let cwd = currentCwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty else { return nil }
+        if let matched = workspaces.first(where: { $0.path == cwd }) { return matched.name }
+        return cwd == "/" ? "/" : (cwd as NSString).lastPathComponent
+    }
+    var currentWorkspaceDisplayPath: String? {
+        guard let cwd = currentCwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty else { return nil }
+        if let matched = workspaces.first(where: { $0.path == cwd }) { return matched.displayPath }
+        return cwd
+    }
     var needsRepair: Bool {
         guard connection == .error, let message = connectionError else { return false }
         return ["配对", "密钥", "加密", "not paired"].contains { message.localizedCaseInsensitiveContains($0) }
@@ -62,6 +99,7 @@ final class AppModel: ObservableObject {
     private var serial = 0
     private var legacyCatalog = false
     private var transportConnected = false
+    private var activeSessionChangeDestination: SessionDestination?
     private var queuedSession: SessionDestination?
     private var requests: [String: RequestKind] = [:]
     private var deadlines: [String: Task<Void, Never>] = [:]
@@ -85,8 +123,9 @@ final class AppModel: ObservableObject {
     }
 
     private enum SessionDestination: Equatable {
-        case new, existing(String)
+        case new(cwd: String?), existing(String)
         var path: String? { if case .existing(let path) = self { return path }; return nil }
+        var cwd: String? { if case .new(let cwd) = self { return cwd }; return nil }
     }
 
     private enum SettingChange {
@@ -120,7 +159,7 @@ final class AppModel: ObservableObject {
     }
 
     private enum RequestKind {
-        case state(refreshHistory: Bool, promptReceiptIDs: Set<String>), history, models, catalog, prompt, sessionChange(SessionDestination), setting, command
+        case state(refreshHistory: Bool, promptReceiptIDs: Set<String>), history, models, catalog, workspaces, prompt, sessionChange(SessionDestination), setting, command
     }
 
     convenience init() { self.init(client: RelayClient()) }
@@ -183,7 +222,7 @@ final class AppModel: ObservableObject {
         client.setForeground(true)
         guard isPaired else { return }
         if client.isConnected { refreshConversation() }
-        else { client.connectIfNeeded() }
+        else if !client.isAutoReconnecting { client.connectIfNeeded() }
     }
 
     func suspendConnectionChecks() { client.setForeground(false) }
@@ -225,6 +264,8 @@ final class AppModel: ObservableObject {
     func resetPairing() {
         client.resetPairing()
         isPaired = false
+        hasConnectedOnce = false
+        reconnectPhase = .none
         connection = .idle
         clearError()
         settingInFlight = nil
@@ -237,11 +278,16 @@ final class AppModel: ObservableObject {
         endpointHost = nil
         publishSettings()
         cancelRequests()
+        activeSessionChangeDestination = nil
         queuedSession = nil
         conversation = ConversationState()
         publishConversation()
         approvals.removeAll()
         sessions.removeAll()
+        workspaces.removeAll()
+        currentCwd = nil
+        defaultCwd = nil
+        isLoadingWorkspaces = false
         models.removeAll()
         selectedSessionPath = nil
         selectedSessionTitle = nil
@@ -280,6 +326,29 @@ final class AppModel: ObservableObject {
         sendRPC(["type": "session_catalog", "id": id], kind: .catalog, failure: "加载会话列表失败")
     }
 
+    func loadWorkspaces() {
+        guard client.isConnected else { return }
+        for (id, kind) in requests {
+            if case .workspaces = kind { finishRequest(id) }
+        }
+        isLoadingWorkspaces = true
+        let id = nextID("workspaces")
+        sendRPC(["type": "list_workspaces", "id": id], kind: .workspaces, failure: "加载工作区列表失败")
+    }
+
+    private func applyWorkspacePayload(_ data: [String: Any]?) {
+        guard let data else { return }
+        if let rawList = data["workspaces"] as? [[String: Any]] {
+            workspaces = AgyWorkspaceOption.parseList(rawList)
+        }
+        if let cwd = data["currentCwd"] as? String, !cwd.isEmpty {
+            currentCwd = cwd
+        }
+        if let fallbackDefault = data["defaultCwd"] as? String, !fallbackDefault.isEmpty {
+            defaultCwd = fallbackDefault
+        }
+    }
+
     func applySessionList(_ list: [[String: Any]]) {
         sessions = list
         if let path = selectedSessionPath, let entry = list.first(where: { ($0["path"] as? String) == path }).flatMap(AgySessionEntry.init) {
@@ -287,7 +356,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func newSession() { selectSession(.new) }
+    func newSession(cwd: String? = nil) {
+        let trimmed = cwd?.trimmingCharacters(in: .whitespacesAndNewlines)
+        selectSession(.new(cwd: trimmed?.isEmpty == true ? nil : trimmed))
+    }
 
     func switchSession(_ path: String) {
         guard !path.isEmpty else { return }
@@ -298,6 +370,10 @@ final class AppModel: ObservableObject {
         focusComposer = false
         showConversation = true
         guard client.isConnected else {
+            if client.isSilentlyReconnecting {
+                queuedSession = destination
+                return
+            }
             connectionError = "连接已断开，请连接后再打开会话"
             client.connectIfNeeded()
             return
@@ -308,12 +384,12 @@ final class AppModel: ObservableObject {
         }
         // Native commands are asynchronous. Serialize them so a late switch cannot
         // undo the user's newer selection on the gateway.
-        if let pending = conversation.pendingChange {
+        if conversation.pendingChange != nil {
             guard conversation.isWaitingForSessionResponse else {
                 actionError = "上一次切换结果尚未确认，请等待确认后再切换"
                 return
             }
-            queuedSession = pending.path == destination.path ? nil : destination
+            queuedSession = activeSessionChangeDestination == destination ? nil : destination
             return
         }
         if case .existing(let path) = destination,
@@ -327,10 +403,12 @@ final class AppModel: ObservableObject {
     private func startSessionChange(_ destination: SessionDestination) {
         let id = nextID("session")
         guard conversation.beginSessionChange(id: id, path: destination.path) else { return }
+        activeSessionChangeDestination = destination
         discardReadRequests()
         publishConversation()
         var command: [String: Any] = ["type": destination.path == nil ? "new_session" : "switch_session", "id": id]
         if let path = destination.path { command["sessionPath"] = path }
+        if let cwd = destination.cwd { command["cwd"] = cwd }
         sendRPC(command, kind: .sessionChange(destination), failure: "切换会话失败")
     }
 
@@ -465,7 +543,13 @@ final class AppModel: ObservableObject {
     private func send(_ object: [String: Any], failure: String) {
         Task {
             do { try await client.send(object) }
-            catch { actionError = "\(failure)：\(error.localizedDescription)" }
+            catch {
+                if (!client.isConnected || client.isAutoReconnecting),
+                   (object["type"] as? String) == "session_list" {
+                    return
+                }
+                actionError = "\(failure)：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -487,6 +571,9 @@ final class AppModel: ObservableObject {
                 // Both reads can still succeed. A visible transcript can refresh silently.
                 if conversation.historyTimedOut(id: id) { historyReadError = message }
                 publishConversation()
+            case .workspaces:
+                finishRequest(id)
+                isLoadingWorkspaces = false
             default:
                 requestFailed(id: id, message: message, outcomeUnknown: true)
             }
@@ -494,7 +581,24 @@ final class AppModel: ObservableObject {
         Task {
             guard generation == transportGeneration, requests[id] != nil else { return }
             do { try await client.send(["type": "rpc", "id": id, "command": command]) }
-            catch { requestFailed(id: id, message: "\(failure)：\(error.localizedDescription)", outcomeUnknown: true) }
+            catch {
+                guard generation == transportGeneration, requests[id] != nil else { return }
+                if !client.isConnected || client.isAutoReconnecting {
+                    switch kind {
+                    case .state, .history, .models, .catalog:
+                        finishRequest(id)
+                        _ = conversation.failRequest(id: id)
+                        return
+                    case .workspaces:
+                        finishRequest(id)
+                        isLoadingWorkspaces = false
+                        return
+                    default:
+                        break
+                    }
+                }
+                requestFailed(id: id, message: "\(failure)：\(error.localizedDescription)", outcomeUnknown: true)
+            }
         }
     }
 
@@ -557,11 +661,15 @@ final class AppModel: ObservableObject {
             return
         case .sessionChange:
             _ = conversation.failRequest(id: id, outcomeUnknown: outcomeUnknown)
+            activeSessionChangeDestination = nil
             // Do not dispatch a queued transition when the preceding result is unknown.
             queuedSession = nil
             reconcile = true
         case .state, .history:
             guard conversation.failRequest(id: id) else { return }
+        case .workspaces:
+            isLoadingWorkspaces = false
+            return
         case .models, .catalog, .command, .setting:
             break
         }
@@ -661,7 +769,7 @@ final class AppModel: ObservableObject {
         if success {
             switch kind {
             case .models, .prompt, .command, .setting, .sessionChange: clearStateTimeout()
-            case .catalog, .history, .state: break // Gateway-local reads or a state snapshot validated below.
+            case .catalog, .workspaces, .history, .state: break // Gateway-local reads or a state snapshot validated below.
             }
         }
         if case .setting = kind {
@@ -679,7 +787,12 @@ final class AppModel: ObservableObject {
                     loadSessions()
                     return
                 }
+            case .workspaces:
+                // 兼容旧版网关不支持 list_workspaces，静默回退到由会话推导的工作区列表
+                isLoadingWorkspaces = false
+                return
             case .sessionChange:
+                activeSessionChangeDestination = nil
                 _ = conversation.resolveSessionChange(id: id, success: false)
                 if continueQueuedSession() { return }
                 refreshConversation()
@@ -700,6 +813,12 @@ final class AppModel: ObservableObject {
             }
             finishRequest(id)
             applySessionList(list)
+            applyWorkspacePayload(data)
+            return
+        case .workspaces:
+            finishRequest(id)
+            isLoadingWorkspaces = false
+            applyWorkspacePayload(data)
             return
         case .models:
             finishRequest(id)
@@ -707,12 +826,18 @@ final class AppModel: ObservableObject {
         case .prompt: return
         case .sessionChange(let destination):
             finishRequest(id)
+            activeSessionChangeDestination = nil
             let cancelled = data?["cancelled"] as? Bool == true
             let changed = conversation.resolveSessionChange(id: id, success: true, cancelled: cancelled)
             if continueQueuedSession() { return }
             if changed {
                 actionError = nil
                 approvals.removeAll()
+                if let cwd = data?["cwd"] as? String, !cwd.isEmpty {
+                    currentCwd = cwd
+                } else if let requestedCwd = destination.cwd {
+                    currentCwd = requestedCwd
+                }
                 if let path = destination.path {
                     requestHistory(path: path)
                 } else {
@@ -733,6 +858,8 @@ final class AppModel: ObservableObject {
             }
             finishRequest(id)
             stateReadError = nil
+            if let cwd = data["cwd"] as? String, !cwd.isEmpty { currentCwd = cwd }
+            if let fallbackDefault = data["defaultCwd"] as? String, !fallbackDefault.isEmpty { defaultCwd = fallbackDefault }
             let path = data["sessionFile"] as? String
             let running = streaming || data["isCompacting"] as? Bool == true || (data["pendingMessageCount"] as? Int ?? 0) > 0
             let recoveringChangeID = conversation.pendingChange?.id
@@ -747,6 +874,7 @@ final class AppModel: ObservableObject {
             guard conversation.pendingChange == nil else { return }
             if let recoveringChangeID {
                 finishRequest(recoveringChangeID)
+                activeSessionChangeDestination = nil
                 actionError = nil
             }
             applyModelState(data)
@@ -873,14 +1001,20 @@ final class AppModel: ObservableObject {
     private func apply(connectionState state: ConnectionState, error: String?) {
         let connected = state == .paired || state == .running
         let newlyConnected = connected && !transportConnected
-        if transportConnected && !connected { transportGeneration += 1 }
+        let newlyDisconnected = transportConnected && !connected
+        if newlyDisconnected { transportGeneration += 1 }
         transportConnected = connected
+        if connected { hasConnectedOnce = true }
+        reconnectPhase = client.reconnectPhase
         connectionError = state == .error ? (error ?? "连接出错") : nil
         if !connected {
             stateReadError = nil
             historyReadError = nil
+            isLoadingWorkspaces = false
             conversation.disconnected()
-            queuedSession = nil
+            if newlyDisconnected {
+                queuedSession = nil
+            }
             markSettingUncertain()
             cancelRequests(keepingMutations: true)
             if conversation.pendingChange != nil { actionError = "连接中断时会话切换尚未确认，已保留原会话并暂停发送" }
@@ -901,6 +1035,6 @@ final class AppModel: ObservableObject {
         LiveActivityManager.shared.sync(
             sessionID: "current", title: selectedSessionTitle ?? "Antigravity", phase: phase,
             approvalCount: approvals.count, model: selectedModel,
-            modeLabel: agentMode.title, workspaceShort: "antigravity", lastToolName: messages.last(where: { $0.role == .tool })?.toolTitle)
+            modeLabel: agentMode.title, workspaceShort: currentWorkspaceName ?? "antigravity", lastToolName: messages.last(where: { $0.role == .tool })?.toolTitle)
     }
 }

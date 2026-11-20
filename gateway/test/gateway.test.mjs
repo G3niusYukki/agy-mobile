@@ -2,14 +2,14 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { createCipheriv, createDecipheriv, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes } from "node:crypto"
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import WebSocket from "ws"
 import { AgyRunner, parseAgyModelsOutput } from "../src/agy-runner.mjs"
 import { extractUserRequestText, readSessionHistoryStrict } from "../src/history.mjs"
-import { listSessionCatalog } from "../src/session-catalog.mjs"
+import { listSessionCatalog, listWorkspaces } from "../src/session-catalog.mjs"
 
 const SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex")
 
@@ -284,6 +284,211 @@ test("AgyRunner 切入桌面端会话时自动注入近期上下文且不触发 
   } finally {
     if (prevCliEnv === undefined) delete process.env.FAKE_AGY_CLI_DIR
     else process.env.FAKE_AGY_CLI_DIR = prevCliEnv
+    rmSync(work, { recursive: true, force: true })
+  }
+})
+
+test("listWorkspaces 聚合最近会话、固定工作区与本机 Git 项目，且 new_session 按选定目录启动 agy", async () => {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), "agy-ws-test-")))
+  const dataDir = join(work, "antigravity")
+  const scanRoot = join(work, "home")
+  const wsAgy = join(scanRoot, "agy-mobile")
+  const wsPi = join(scanRoot, "pi-mobile")
+  const wsGitOnly = join(scanRoot, "other-repo")
+  const recentFile = join(work, "recent-workspaces.json")
+  const fakeAgy = new URL("./fake-agy.mjs", import.meta.url).pathname
+  chmodSync(fakeAgy, 0o755)
+
+  try {
+    mkdirSync(dataDir, { recursive: true })
+    mkdirSync(join(wsAgy, ".git"), { recursive: true })
+    mkdirSync(join(wsPi, ".git"), { recursive: true })
+    mkdirSync(join(wsGitOnly, ".git"), { recursive: true })
+
+    const db = new DatabaseSync(join(dataDir, "conversation_summaries.db"))
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id text PRIMARY KEY,
+        title text NOT NULL DEFAULT "",
+        preview text NOT NULL DEFAULT "",
+        step_count integer NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL,
+        workspace_uris text NOT NULL,
+        status text NOT NULL DEFAULT "",
+        parent_conversation_id text NOT NULL DEFAULT "",
+        nesting_depth integer NOT NULL DEFAULT 0,
+        killed numeric NOT NULL DEFAULT false
+      )
+    `)
+    db.prepare(`INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, 0)`)
+      .run("aaaaaaaa-bbbb-4ccc-8ddd-111111111111", "Agy Task", "Preview", 3, "2026-11-20 02:00:00+00:00", JSON.stringify([`file://${wsAgy}`]), "IDLE")
+    db.prepare(`INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, 0)`)
+      .run("aaaaaaaa-bbbb-4ccc-8ddd-222222222222", "Pi Task", "Preview", 2, "2026-11-19 02:00:00+00:00", JSON.stringify([`file://${wsPi}`]), "IDLE")
+    db.prepare(`INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, 0)`)
+      .run("aaaaaaaa-bbbb-4ccc-8ddd-333333333333", "Deleted", "Preview", 1, "2026-11-20 03:00:00+00:00", JSON.stringify([`file://${join(scanRoot, "deleted-dir")}`]), "IDLE")
+    db.close()
+
+    const list = await listWorkspaces({
+      dataDirs: [dataDir],
+      home: scanRoot,
+      defaultCwd: scanRoot,
+      currentCwd: scanRoot,
+      extraWorkspaces: [],
+      recentWorkspacesFile: recentFile,
+      scanRoots: [scanRoot],
+    })
+    assert.deepEqual(list.map((w) => [w.name, w.source, w.displayPath]), [
+      ["agy-mobile", "recent", "~/agy-mobile"],
+      ["pi-mobile", "recent", "~/pi-mobile"],
+      ["home", "default", "~"],
+      ["other-repo", "project", "~/other-repo"],
+    ])
+
+    // 验证 AgyRunner.newSession({ cwd }) 真正以选定目录作为 agy 进程 cwd 启动
+    const events = []
+    let settleResolve
+    const settled = new Promise((r) => { settleResolve = r })
+    const runner = new AgyRunner({
+      agyBin: fakeAgy,
+      cwd: scanRoot,
+      dataDirs: [dataDir],
+      recentWorkspacesFile: recentFile,
+      onEvent(ev) {
+        events.push(ev)
+        if (ev.type === "agent_settled") settleResolve()
+      },
+    })
+
+    await assert.rejects(() => runner.newSession({ cwd: join(scanRoot, "does-not-exist") }), /工作目录不存在/)
+
+    const res = await runner.newSession({ cwd: wsPi })
+    assert.equal(res.cancelled, false)
+    assert.equal(res.cwd, wsPi)
+    assert.equal(runner.getState().cwd, wsPi)
+    assert.equal(runner.getState().defaultCwd, scanRoot)
+
+    runner.sendPrompt({ message: "check show-cwd" })
+    await settled
+    const reply = events.find((e) => e.type === "message_end")
+    assert.ok(reply)
+    assert.match(reply.message.content[0].text, new RegExp(`\\[cwd=${wsPi.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`))
+
+    // 选定后的目录会被记入最近工作区，刷新后排到最前
+    const updatedList = await listWorkspaces({
+      dataDirs: [dataDir],
+      home: scanRoot,
+      defaultCwd: scanRoot,
+      currentCwd: wsPi,
+      extraWorkspaces: [],
+      recentWorkspacesFile: recentFile,
+      scanRoots: [scanRoot],
+    })
+    assert.equal(updatedList[0].path, wsPi)
+
+    runner.shutdown()
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+})
+
+test("agy-gateway RPC：list_workspaces 与带 cwd 的 new_session 端到端贯通", async () => {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), "agy-gw-ws-")))
+  const projA = join(work, "proj-alpha")
+  const projB = join(work, "proj-beta")
+  mkdirSync(join(projA, ".git"), { recursive: true })
+  mkdirSync(join(projB, ".git"), { recursive: true })
+  const fakeAgy = new URL("./fake-agy.mjs", import.meta.url).pathname
+  chmodSync(fakeAgy, 0o755)
+  const port = 18792
+
+  const proc = spawn("node", ["src/index.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: {
+      ...process.env,
+      ENABLE_LOCAL: "1",
+      LOCAL_HOST: "127.0.0.1",
+      LOCAL_PORT: String(port),
+      AGY_BIN: fakeAgy,
+      AGY_CWD: projA,
+      AGY_WORKSPACES: `${projA}:${projB}`,
+      AGY_SCAN_WORKSPACE_ROOTS: "0",
+      AGY_RECENT_WORKSPACES_PATH: join(work, "recent.json"),
+      AGY_MOBILE_GATEWAY_KEY_PATH: join(work, "gw.key"),
+      AGY_LATEST_PAIR_PATH: join(work, "latest-pair.json"),
+      RELAY_URL: "",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+
+  try {
+    const pairLink = await new Promise((resolve, reject) => {
+      let out = ""
+      const t = setTimeout(() => reject(new Error(`gateway did not print pair link:\n${out}`)), 6000)
+      proc.stdout.on("data", (d) => {
+        out += String(d)
+        const match = /http:\/\/[^\s]+\/agy\/pair#([0-9a-f]{32})\.([A-Za-z0-9_-]+)/.exec(out)
+        if (match) {
+          clearTimeout(t)
+          resolve({ token: match[1], pub: match[2] })
+        }
+      })
+    })
+
+    const e2e = makeClientE2E(pairLink.pub)
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/agy/client`)
+    await new Promise((r) => ws.once("open", r))
+
+    const inbox = []
+    const waiters = []
+    ws.on("message", (raw) => {
+      const msg = JSON.parse(String(raw))
+      const idx = waiters.findIndex((w) => w.pred(msg))
+      if (idx >= 0) waiters.splice(idx, 1)[0].resolve(msg)
+      else inbox.push(msg)
+    })
+    function nextMsg(pred, ms = 5000) {
+      const idx = inbox.findIndex(pred)
+      if (idx >= 0) return Promise.resolve(inbox.splice(idx, 1)[0])
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("timeout waiting frame")), ms)
+        waiters.push({ pred, resolve: (m) => { clearTimeout(timer); resolve(m) } })
+      })
+    }
+
+    ws.send(JSON.stringify({ type: "pair", token: pairLink.token, pub: e2e.pub }))
+    await nextMsg((m) => m.type === "paired")
+
+    async function rpc(command) {
+      ws.send(JSON.stringify({ type: "rpc", id: command.id, sealed: e2e.seal({ command }) }))
+      const frame = await nextMsg((m) => m.type === "rpc_response")
+      return e2e.open(frame.sealed)
+    }
+
+    const wsRes = await rpc({ type: "list_workspaces", id: "ws1" })
+    assert.equal(wsRes.success, true)
+    assert.equal(wsRes.data.defaultCwd, projA)
+    assert.ok(wsRes.data.workspaces.some((w) => w.path === projB))
+
+    const newRes = await rpc({ type: "new_session", id: "ns1", cwd: projB })
+    assert.equal(newRes.success, true)
+    assert.equal(newRes.data.cwd, projB)
+
+    const promptRes = await rpc({ type: "prompt", id: "p1", message: "hello show-cwd" })
+    assert.equal(promptRes.success, true)
+
+    const events = []
+    while (true) {
+      const frame = await nextMsg((m) => m.type === "event")
+      const ev = e2e.open(frame.sealed)
+      events.push(ev)
+      if (ev.type === "agent_settled") break
+    }
+    const finalMsg = events.find((e) => e.type === "message_end")
+    assert.match(finalMsg.message.content[0].text, new RegExp(`\\[cwd=${projB.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`))
+
+    ws.close()
+  } finally {
+    proc.kill("SIGTERM")
     rmSync(work, { recursive: true, force: true })
   }
 })

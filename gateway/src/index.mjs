@@ -10,7 +10,7 @@ import { AgyRunner } from "./agy-runner.mjs"
 import { createE2EChannel, gatewayPublicKey } from "./crypto.mjs"
 import { MAX_ATTACHMENT_BYTES, readSessionHistoryStrict } from "./history.mjs"
 import { createLocalDirectServer, discoverLocalAddresses } from "./local-server.mjs"
-import { defaultDataDirs, listSessionCatalog } from "./session-catalog.mjs"
+import { defaultDataDirs, listSessionCatalog, listWorkspaces } from "./session-catalog.mjs"
 
 try {
   for (const line of readFileSync(new URL("../.env", import.meta.url), "utf8").split(/\r?\n/)) {
@@ -92,13 +92,47 @@ function sendReply(ch, response) {
   if (sealed) ch.send({ type: "rpc_response", sealed })
 }
 
+async function getWorkspaceList() {
+  return listWorkspaces({
+    dataDirs: DATA_DIRS,
+    defaultCwd: runner.defaultCwd,
+    currentCwd: runner.currentCwd,
+    recentWorkspacesFile: runner.recentWorkspacesFile,
+  })
+}
+
 async function handleRPC(ch, command, fallbackId) {
   const id = command?.id ?? fallbackId ?? null
   const type = command?.type
   try {
     if (type === "session_catalog") {
-      const sessions = await listSessionCatalog(DATA_DIRS)
-      sendReply(ch, { id, success: true, data: { sessions } })
+      const [sessions, workspaces] = await Promise.all([
+        listSessionCatalog(DATA_DIRS),
+        getWorkspaceList(),
+      ])
+      sendReply(ch, {
+        id,
+        success: true,
+        data: {
+          sessions,
+          workspaces,
+          defaultCwd: runner.defaultCwd,
+          currentCwd: runner.currentCwd,
+        },
+      })
+      return
+    }
+    if (type === "list_workspaces") {
+      const workspaces = await getWorkspaceList()
+      sendReply(ch, {
+        id,
+        success: true,
+        data: {
+          workspaces,
+          defaultCwd: runner.defaultCwd,
+          currentCwd: runner.currentCwd,
+        },
+      })
       return
     }
     if (type === "session_history") {
@@ -173,7 +207,7 @@ async function handleRPC(ch, command, fallbackId) {
       return
     }
     if (type === "new_session") {
-      const data = await runner.newSession()
+      const data = await runner.newSession({ cwd: command.cwd })
       sendReply(ch, { id, success: true, data })
       return
     }

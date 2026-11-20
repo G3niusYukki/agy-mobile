@@ -1,12 +1,12 @@
 import Foundation
 import Combine
+import Network
 
 @MainActor
 public final class RelayClient: ObservableObject {
-    @Published public private(set) var state: ConnectionState = .idle {
-        didSet { onConnectionChange?(state, lastError) }
-    }
+    @Published public private(set) var state: ConnectionState = .idle
     @Published public private(set) var lastError: String?
+    @Published public private(set) var reconnectPhase: ReconnectPhase = .none
     @Published public private(set) var transportKind: ConnectionTransportKind?
     @Published public private(set) var endpointHost: String?
 
@@ -20,12 +20,52 @@ public final class RelayClient: ObservableObject {
     public var onSessionList: (([[String: Any]]) -> Void)?
 
     public var isConnected: Bool { state == .paired || state == .running }
-
+    public var isSilentlyReconnecting: Bool { reconnectPhase == .silentGrace }
+    public var isAutoReconnecting: Bool { reconnectPhase != .none }
     public var hasPairing: Bool { store.restore() != nil }
+
+    struct NetworkPathSnapshot: Equatable, Sendable {
+        let isSatisfied: Bool
+        let interfaceNames: [String]
+        let isExpensive: Bool
+        let isConstrained: Bool
+
+        init(isSatisfied: Bool, interfaceNames: [String], isExpensive: Bool = false, isConstrained: Bool = false) {
+            self.isSatisfied = isSatisfied
+            self.interfaceNames = interfaceNames.sorted()
+            self.isExpensive = isExpensive
+            self.isConstrained = isConstrained
+        }
+
+        init(_ path: NWPath) {
+            self.init(
+                isSatisfied: path.status == .satisfied,
+                interfaceNames: path.availableInterfaces.map(\.name),
+                isExpensive: path.isExpensive,
+                isConstrained: path.isConstrained
+            )
+        }
+    }
 
     private enum Handshake {
         case pair(PairingLink)
         case resume(token: String, key: E2EKey, endpoint: URL)
+    }
+
+    private final class PathMonitorBox: @unchecked Sendable {
+        private let monitor = NWPathMonitor()
+        private let queue = DispatchQueue(label: "agy-mobile.network-path-monitor", qos: .utility)
+
+        init(onChange: @escaping @Sendable (NetworkPathSnapshot) -> Void) {
+            monitor.pathUpdateHandler = { path in
+                onChange(NetworkPathSnapshot(path))
+            }
+            monitor.start(queue: queue)
+        }
+
+        deinit {
+            monitor.cancel()
+        }
     }
 
     private let configuredEndpoint: URL?
@@ -35,13 +75,22 @@ public final class RelayClient: ObservableObject {
     private var receiver: Task<Void, Never>?
     private var handshake: Handshake?
     private var e2e: E2EKey?
-    private var reconnectDelay: UInt64 = 1_000_000_000
+    private let initialReconnectDelay: Duration
+    private let maxReconnectDelay: Duration
+    private var reconnectDelay: Duration
     private var retry: Task<Void, Never>?
     private var isForeground = true
+    private var pendingForegroundReconnect = false
     private let pongTimeout: Duration
+    private let foregroundProbeTimeout: Duration
     private let heartbeatInterval: Duration
+    private let reconnectGracePeriod: Duration
     private var heartbeat: Task<Void, Never>?
+    private var graceTask: Task<Void, Never>?
+    private var graceTargetPhase: ReconnectPhase = .retryingGentle
     private var probeID: UUID?
+    private var pathMonitor: PathMonitorBox?
+    private var lastNetworkPath: NetworkPathSnapshot?
 
     public convenience init(endpoint: String? = nil) {
         self.init(endpoint: endpoint, store: .keychain, makeSocket: Self.webSocket)
@@ -53,23 +102,109 @@ public final class RelayClient: ObservableObject {
         return task
     }
 
-    public func setForeground(_ foreground: Bool) {
-        guard isForeground != foreground else { return }
-        isForeground = foreground
-        cancelHeartbeat()
-        if foreground { probeSocket() }
-    }
-
-    init(endpoint: String?, store: PairingStore, pongTimeout: Duration = .seconds(8),
-         heartbeatInterval: Duration = .seconds(20), makeSocket: @escaping (URLRequest) -> any RelaySocket) {
+    init(
+        endpoint: String?,
+        store: PairingStore,
+        pongTimeout: Duration = .seconds(8),
+        foregroundProbeTimeout: Duration = .seconds(2),
+        heartbeatInterval: Duration = .seconds(20),
+        reconnectGracePeriod: Duration = .milliseconds(2500),
+        initialReconnectDelay: Duration = .milliseconds(250),
+        maxReconnectDelay: Duration = .seconds(15),
+        enableNetworkMonitor: Bool = true,
+        makeSocket: @escaping (URLRequest) -> any RelaySocket
+    ) {
         self.configuredEndpoint = endpoint.flatMap { URL(string: $0, encodingInvalidCharacters: false) }
         self.store = store
         self.makeSocket = makeSocket
         self.pongTimeout = pongTimeout
+        self.foregroundProbeTimeout = foregroundProbeTimeout
         self.heartbeatInterval = heartbeatInterval
+        self.reconnectGracePeriod = reconnectGracePeriod
+        self.initialReconnectDelay = initialReconnectDelay
+        self.maxReconnectDelay = maxReconnectDelay
+        self.reconnectDelay = initialReconnectDelay
         if let saved = store.restore() {
             self.transportKind = PairingLink.transportKind(for: saved.endpoint)
             self.endpointHost = saved.endpoint.host
+        }
+        if enableNetworkMonitor {
+            self.pathMonitor = PathMonitorBox { [weak self] snapshot in
+                Task { @MainActor [weak self] in
+                    self?.handleNetworkPathChange(snapshot)
+                }
+            }
+        }
+    }
+
+    private func publishConnection(state newState: ConnectionState, error newError: String?, reconnectPhase newPhase: ReconnectPhase) {
+        let changed = state != newState || lastError != newError || reconnectPhase != newPhase
+        lastError = newError
+        reconnectPhase = newPhase
+        state = newState
+        if changed {
+            onConnectionChange?(state, lastError)
+        }
+    }
+
+    public func setForeground(_ foreground: Bool) {
+        guard isForeground != foreground else { return }
+        isForeground = foreground
+        if !foreground {
+            cancelHeartbeat()
+            retry?.cancel()
+            retry = nil
+            graceTask?.cancel()
+            graceTask = nil
+            if !isConnected && (reconnectPhase != .none || state == .connecting) {
+                pendingForegroundReconnect = true
+            }
+            return
+        }
+
+        // 回到前台：根据当前套接字状态决定快速探活还是带静默宽限期的无感重连
+        if socket != nil, e2e != nil {
+            if reconnectPhase == .silentGrace {
+                startReconnectGrace(targetAfterGrace: graceTargetPhase, forceRestart: true)
+            }
+            probeSocket(timeout: foregroundProbeTimeout)
+            return
+        }
+        if socket != nil, case .resume = handshake {
+            pendingForegroundReconnect = false
+            reconnectDelay = initialReconnectDelay
+            openResumeConnection(silentGrace: true, forceRestartGrace: true)
+            return
+        }
+        if socket == nil, hasPairing,
+           pendingForegroundReconnect || reconnectPhase != .none || state == .idle {
+            pendingForegroundReconnect = false
+            reconnectDelay = initialReconnectDelay
+            openResumeConnection(silentGrace: true, forceRestartGrace: true)
+        }
+    }
+
+    func handleNetworkPathChange(_ snapshot: NetworkPathSnapshot) {
+        let previous = lastNetworkPath
+        lastNetworkPath = snapshot
+        guard let previous, previous != snapshot else { return }
+        guard isForeground, hasPairing else { return }
+        if case .pair = handshake { return }
+
+        if snapshot.isSatisfied {
+            if socket == nil {
+                reconnectDelay = initialReconnectDelay
+                let keepGentle = reconnectPhase == .retryingGentle
+                openResumeConnection(silentGrace: !keepGentle, forceRestartGrace: false)
+            } else if e2e != nil {
+                probeSocket(timeout: foregroundProbeTimeout)
+            } else if case .resume = handshake {
+                reconnectDelay = initialReconnectDelay
+                let keepGentle = reconnectPhase == .retryingGentle
+                openResumeConnection(silentGrace: !keepGentle, forceRestartGrace: false)
+            }
+        } else if socket != nil, e2e != nil {
+            probeSocket(timeout: foregroundProbeTimeout)
         }
     }
 
@@ -79,23 +214,56 @@ public final class RelayClient: ObservableObject {
         probeID = nil
     }
 
+    private func cancelGrace() {
+        graceTask?.cancel()
+        graceTask = nil
+    }
+
+    private func startReconnectGrace(targetAfterGrace: ReconnectPhase, forceRestart: Bool) {
+        graceTargetPhase = targetAfterGrace
+        if !isForeground {
+            cancelGrace()
+            reconnectPhase = .silentGrace
+            pendingForegroundReconnect = true
+            return
+        }
+        if !forceRestart {
+            if reconnectPhase == .retryingGentle || reconnectPhase == .gatewayOfflineGentle {
+                return
+            }
+            if reconnectPhase == .silentGrace, graceTask != nil {
+                return
+            }
+        }
+        cancelGrace()
+        reconnectPhase = .silentGrace
+        graceTask = Task { [weak self, reconnectGracePeriod] in
+            do { try await Task.sleep(for: reconnectGracePeriod) } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            guard self.isForeground, !self.isConnected, self.reconnectPhase == .silentGrace else { return }
+            self.graceTask = nil
+            self.publishConnection(state: self.state, error: nil, reconnectPhase: targetAfterGrace)
+        }
+    }
+
     private func scheduleHeartbeat() {
         cancelHeartbeat()
         guard isForeground, let socket, e2e != nil else { return }
         heartbeat = Task { [weak self, weak socket, heartbeatInterval] in
             do { try await Task.sleep(for: heartbeatInterval) } catch { return }
             guard let self, let socket, self.socket === socket else { return }
-            self.probeSocket()
+            self.probeSocket(timeout: self.pongTimeout)
         }
     }
 
-    private func probeSocket() {
+    private func probeSocket(timeout: Duration? = nil) {
         guard isForeground, let socket, e2e != nil, probeID == nil else { return }
         heartbeat?.cancel()
+        let effectiveTimeout = timeout ?? pongTimeout
         let id = UUID()
         probeID = id
-        heartbeat = Task { [weak self, weak socket, pongTimeout] in
-            do { try await Task.sleep(for: pongTimeout) } catch { return }
+        heartbeat = Task { [weak self, weak socket, effectiveTimeout] in
+            do { try await Task.sleep(for: effectiveTimeout) } catch { return }
             guard let self, let socket, self.probeID == id else { return }
             self.transportLost(on: socket, message: "连接中断，正在重新连接…")
         }
@@ -109,7 +277,22 @@ public final class RelayClient: ObservableObject {
     }
 
     public func connect() {
-        disconnect()
+        reconnectDelay = initialReconnectDelay
+        let keepGentle = reconnectPhase == .retryingGentle || reconnectPhase == .gatewayOfflineGentle
+        openResumeConnection(silentGrace: false, forceRestartGrace: false, preserveGentle: keepGentle)
+    }
+
+    public func connectIfNeeded() {
+        guard !isConnected, state != .connecting else { return }
+        reconnectDelay = initialReconnectDelay
+        openResumeConnection(silentGrace: true, forceRestartGrace: true)
+    }
+
+    private func openResumeConnection(silentGrace: Bool, forceRestartGrace: Bool, preserveGentle: Bool = false) {
+        retry?.cancel()
+        retry = nil
+        pendingForegroundReconnect = false
+        closeSocket()
         guard let saved = store.restore() else {
             fail(PairingLink.Failure.missingRelay.localizedDescription)
             return
@@ -117,12 +300,18 @@ public final class RelayClient: ObservableObject {
         transportKind = PairingLink.transportKind(for: saved.endpoint)
         endpointHost = saved.endpoint.host
         handshake = .resume(token: saved.token, key: saved.key, endpoint: saved.endpoint)
-        open(endpoint: saved.endpoint, authorization: saved.token)
-    }
-
-    public func connectIfNeeded() {
-        guard !isConnected, state != .connecting else { return }
-        connect()
+        let phase: ReconnectPhase
+        if silentGrace {
+            startReconnectGrace(targetAfterGrace: .retryingGentle, forceRestart: forceRestartGrace)
+            phase = reconnectPhase
+        } else if preserveGentle {
+            cancelGrace()
+            phase = .retryingGentle
+        } else {
+            cancelGrace()
+            phase = .none
+        }
+        open(endpoint: saved.endpoint, authorization: saved.token, phase: phase)
     }
 
     public func pair(token: String) {
@@ -137,7 +326,7 @@ public final class RelayClient: ObservableObject {
         transportKind = link.transportKind
         endpointHost = link.endpoint.host
         handshake = .pair(link)
-        open(endpoint: link.endpoint, authorization: nil)
+        open(endpoint: link.endpoint, authorization: nil, phase: .none)
     }
 
     public func resetPairing() {
@@ -145,7 +334,7 @@ public final class RelayClient: ObservableObject {
         store.clear()
         transportKind = nil
         endpointHost = nil
-        lastError = nil
+        publishConnection(state: .idle, error: nil, reconnectPhase: .none)
     }
 
     public func send(_ object: [String: Any]) async throws {
@@ -156,20 +345,28 @@ public final class RelayClient: ObservableObject {
             guard let sealed = e2e?.seal(payload) else { throw ClientError.missingKey }
             wire = ["type": type, "id": object["id"] as Any, "sealed": sealed]
         }
-        try await sendWire(wire, on: socket)
+        try await sendWire(wire, on: socket, triggerReconnectOnTransportError: true)
     }
 
-    private func sendWire(_ object: [String: Any], on task: any RelaySocket) async throws {
+    private func sendWire(_ object: [String: Any], on task: any RelaySocket, triggerReconnectOnTransportError: Bool = false) async throws {
         let data = try JSONSerialization.data(withJSONObject: object)
-        try await task.send(.string(String(decoding: data, as: UTF8.self)))
+        do {
+            try await task.send(.string(String(decoding: data, as: UTF8.self)))
+        } catch {
+            if triggerReconnectOnTransportError, socket === task {
+                transportLost(on: task, message: error.localizedDescription)
+            }
+            throw error
+        }
     }
 
     public func disconnect() {
         retry?.cancel()
         retry = nil
+        cancelGrace()
+        pendingForegroundReconnect = false
         closeSocket()
-        lastError = nil
-        state = .idle
+        publishConnection(state: .idle, error: nil, reconnectPhase: .none)
     }
 
     private func closeSocket() {
@@ -186,30 +383,42 @@ public final class RelayClient: ObservableObject {
         guard socket === task else { return }
         if case .pair = handshake { fail(message); return }
         closeSocket()
-        lastError = message
-        state = .error
+
+        guard isForeground else {
+            pendingForegroundReconnect = true
+            cancelGrace()
+            publishConnection(state: .idle, error: nil, reconnectPhase: .silentGrace)
+            return
+        }
+
+        startReconnectGrace(targetAfterGrace: .retryingGentle, forceRestart: false)
+        publishConnection(state: .connecting, error: nil, reconnectPhase: reconnectPhase)
+
         let delay = reconnectDelay
-        reconnectDelay = min(delay * 2, 30_000_000_000)
+        reconnectDelay = min(max(delay * 2, initialReconnectDelay * 4), maxReconnectDelay)
+        retry?.cancel()
         retry = Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: delay) } catch { return }
+            do { try await Task.sleep(for: delay) } catch { return }
             guard let self, !Task.isCancelled, self.isForeground, self.socket == nil else { return }
-            self.connect()
+            self.openResumeConnection(silentGrace: true, forceRestartGrace: false)
         }
     }
 
     private func fail(_ message: String) {
-        disconnect()
-        lastError = message
-        state = .error
+        retry?.cancel()
+        retry = nil
+        cancelGrace()
+        pendingForegroundReconnect = false
+        closeSocket()
+        publishConnection(state: .error, error: message, reconnectPhase: .none)
     }
 
-    private func open(endpoint: URL, authorization: String?) {
+    private func open(endpoint: URL, authorization: String?, phase: ReconnectPhase) {
         var request = URLRequest(url: endpoint)
         if let token = authorization {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        lastError = nil
-        state = .connecting
+        publishConnection(state: .connecting, error: nil, reconnectPhase: phase)
         let task = makeSocket(request)
         socket = task
         task.resume()
@@ -231,6 +440,7 @@ public final class RelayClient: ObservableObject {
             do {
                 let message = try await task.receive()
                 guard !Task.isCancelled, socket === task else { return }
+                if e2e != nil { scheduleHeartbeat() }
                 let text: String
                 switch message {
                 case .string(let value): text = value
@@ -272,9 +482,10 @@ public final class RelayClient: ObservableObject {
         }
         self.handshake = nil
         e2e = key
-        lastError = nil
-        state = .paired
-        reconnectDelay = 1_000_000_000
+        cancelGrace()
+        pendingForegroundReconnect = false
+        reconnectDelay = initialReconnectDelay
+        publishConnection(state: .paired, error: nil, reconnectPhase: .none)
         scheduleHeartbeat()
         onPaired?(token)
     }
@@ -301,18 +512,18 @@ public final class RelayClient: ObservableObject {
                 do { try await sendWire(["type": "pair_pub", "pub": key.publicKey], on: task) }
                 catch { transportLost(on: task, message: error.localizedDescription); return }
                 guard socket === task else { return }
-                if state == .error {
-                    lastError = nil
-                    state = .paired
+                if state == .error || reconnectPhase != .none {
+                    cancelGrace()
+                    publishConnection(state: .paired, error: nil, reconnectPhase: .none)
                 }
                 return
             }
             if (object["state"] as? String) == "unknown" {
-                lastError = "Mac 网关离线"
-                state = .error
+                startReconnectGrace(targetAfterGrace: .gatewayOfflineGentle, forceRestart: false)
+                publishConnection(state: .connecting, error: nil, reconnectPhase: reconnectPhase)
             } else if let status = object["state"] as? String, ["idle", "running", "paired"].contains(status) {
-                lastError = nil
-                state = status == "running" ? .running : .paired
+                cancelGrace()
+                publishConnection(state: status == "running" ? .running : .paired, error: nil, reconnectPhase: .none)
             }
         case "event":
             guard let sealed = object["sealed"] as? String, let event = e2e?.open(sealed) else { return }
@@ -328,9 +539,12 @@ public final class RelayClient: ObservableObject {
             onSessionList?(object["sessions"] as? [[String: Any]] ?? [])
         case "error":
             let message = object["message"] as? String ?? "连接出错"
-            if message == "gateway offline" || message == "not paired" || message.contains("配对") || message.contains("密钥") {
-                lastError = message == "gateway offline" ? "Mac 网关离线" : message
-                state = .error
+            if message == "gateway offline" {
+                startReconnectGrace(targetAfterGrace: .gatewayOfflineGentle, forceRestart: false)
+                publishConnection(state: .connecting, error: nil, reconnectPhase: reconnectPhase)
+            } else if message == "not paired" || message.contains("配对") || message.contains("密钥") || message.contains("加密") {
+                cancelGrace()
+                publishConnection(state: .error, error: message, reconnectPhase: .none)
             } else {
                 onActionError?(message)
             }
@@ -340,9 +554,9 @@ public final class RelayClient: ObservableObject {
     }
 
     private func recoverFromAuthenticatedTraffic() {
-        guard state == .error || lastError != nil else { return }
-        lastError = nil
-        state = .paired
+        guard state == .error || state == .connecting || lastError != nil || reconnectPhase != .none else { return }
+        cancelGrace()
+        publishConnection(state: .paired, error: nil, reconnectPhase: .none)
     }
 
     public enum ClientError: Error {

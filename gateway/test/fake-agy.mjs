@@ -93,7 +93,8 @@ rl.on("line", (line) => {
   }
 
   const replyStep = stepIndex++
-  const answer = `Echo [${model}/${mode}]: ${content}`
+  const cwdSuffix = content.includes("show-cwd") ? ` [cwd=${process.cwd()}]` : ""
+  const answer = `Echo [${model}/${mode}]: ${content}${cwdSuffix}`
   console.log(JSON.stringify({
     event: "step_update",
     step_update: {

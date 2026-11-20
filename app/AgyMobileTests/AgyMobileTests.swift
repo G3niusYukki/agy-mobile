@@ -58,6 +58,14 @@ final class AgyMobileTests: XCTestCase {
         model.selectedModel = model.models[0].id
         model.thinking = "xhigh"
         model.agentMode = .plan
+        model.currentCwd = "/projects/agy-mobile"
+        model.workspaces = [
+            AgyWorkspaceOption(path: "/projects/agy-mobile", name: "agy-mobile", displayPath: "~/agy-mobile", sessionCount: 2, source: .recent),
+            AgyWorkspaceOption(path: "/projects/pi-mobile", name: "pi-mobile", displayPath: "~/pi-mobile", sessionCount: 1, source: .recent),
+            AgyWorkspaceOption(path: "/projects/zcode-mobile", name: "zcode-mobile", displayPath: "~/zcode-mobile", sessionCount: 0, source: .project),
+        ]
+        XCTAssertEqual(model.currentWorkspaceName, "agy-mobile")
+        XCTAssertEqual(model.currentWorkspaceDisplayPath, "~/agy-mobile")
         let now = Date().timeIntervalSince1970 * 1_000
         model.sessions = [
             ["path": "11111111-2222-4333-8444-555555555555", "title": "优化液态玻璃动效", "cwd": "/projects/agy-mobile", "summary": "接入 iOS 26 GlassEffectContainer 与工具预览。", "mtime": now - 120_000],
@@ -80,6 +88,9 @@ final class AgyMobileTests: XCTestCase {
         }
         try await snapshot("agy-settings-light", size: narrow, style: .light, model: model, store: store) {
             AgySettingsView(open: { _ in })
+        }
+        try await snapshot("agy-workspace-picker-dark", size: narrow, style: .dark, model: model, store: store) {
+            WorkspacePickerSheet { _ in }
         }
     }
 

@@ -58,6 +58,13 @@ public enum ConnectionState: String, Sendable, Equatable {
     case idle, connecting, paired, running, error
 }
 
+public enum ReconnectPhase: String, Sendable, Equatable {
+    case none
+    case silentGrace
+    case retryingGentle
+    case gatewayOfflineGentle
+}
+
 public struct ApprovalRequest: Identifiable, Equatable, Sendable {
     public let id: String
     public let method: String

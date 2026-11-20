@@ -12,6 +12,7 @@ struct ConversationScreen: View {
     @State private var photoError: String?
     @State private var tab: ConversationTab = .chat
     @State private var showsSidebar = false
+    @State private var showsWorkspacePicker = false
     @State private var sidebarSearch = ""
     @State private var availableSize = CGSize(width: 390, height: 600)
     @State private var showsPairingReset = false
@@ -24,6 +25,11 @@ struct ConversationScreen: View {
 
     private var bannerStateKey: String {
         if model.needsRepair { return "repair" }
+        if model.isSilentlyReconnecting {
+            if let notice = model.pendingDeliveryNotice { return "notice:\(notice)" }
+            return "none"
+        }
+        if let gentle = model.gentleReconnectMessage { return "gentle:\(gentle)" }
         if let notice = model.pendingDeliveryNotice { return "notice:\(notice)" }
         if let error = model.errorMessage { return "error:\(error)" }
         if !model.isConnected { return "offline:\(model.connection.rawValue)" }
@@ -62,6 +68,11 @@ struct ConversationScreen: View {
         } message: {
             Text("将断开连接并移除本机保存的配对密钥。Mac 上的 Antigravity 会话会保留。")
         }
+        .sheet(isPresented: $showsWorkspacePicker) {
+            WorkspacePickerSheet { cwd in
+                model.newSession(cwd: cwd)
+            }
+        }
     }
 
     private func consumeFocusRequest() {
@@ -94,28 +105,36 @@ struct ConversationScreen: View {
                 Text(toolStepCount > 0 ? "轨迹（\(toolStepCount)）" : "轨迹").tag(ConversationTab.trace)
             }
         } label: {
-            HStack(spacing: 6) {
-                if model.connection == .running {
-                    StatusDot(color: Theme.indigo, size: 7, pulsing: true)
-                        .transition(.scale.combined(with: .opacity))
-                }
-                Text(tab == .trace ? "工具轨迹" : model.selectedSessionTitle ?? "Antigravity")
-                    .appFont(.headline)
-                    .lineLimit(1)
-                    .contentTransition(.opacity)
-                if tab == .chat, toolStepCount > 0 {
-                    Text("\(toolStepCount)")
+            VStack(spacing: 1) {
+                HStack(spacing: 6) {
+                    if model.connection == .running {
+                        StatusDot(color: Theme.indigo, size: 7, pulsing: true)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                    Text(tab == .trace ? "工具轨迹" : model.selectedSessionTitle ?? "Antigravity")
+                        .appFont(.headline)
+                        .lineLimit(1)
+                        .contentTransition(.opacity)
+                    if tab == .chat, toolStepCount > 0 {
+                        Text("\(toolStepCount)")
+                            .appFont(.caption2.weight(.semibold))
+                            .foregroundStyle(Theme.indigo)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Theme.indigo.opacity(0.12), in: Capsule())
+                            .contentTransition(.numericText())
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                    Image(systemName: "chevron.down")
                         .appFont(.caption2.weight(.semibold))
-                        .foregroundStyle(Theme.indigo)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Theme.indigo.opacity(0.12), in: Capsule())
-                        .contentTransition(.numericText())
-                        .transition(.scale.combined(with: .opacity))
+                        .foregroundStyle(.secondary)
                 }
-                Image(systemName: "chevron.down")
-                    .appFont(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                if tab == .chat, let workspace = model.currentWorkspaceName, !workspace.isEmpty {
+                    Text(workspace)
+                        .appFont(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             .foregroundStyle(.primary)
             .animation(AgyMotion.snappy(reduceMotion), value: model.connection == .running)
@@ -149,15 +168,18 @@ struct ConversationScreen: View {
                 Button("新建会话", systemImage: "square.and.pencil") {
                     AgyHaptics.tap()
                     showsSidebar = false
-                    model.newSession()
+                    showsWorkspacePicker = true
                 }
                 .labelStyle(.iconOnly)
-                .disabled(!model.isConnected || model.isLoadingHistory)
+                .disabled((!model.isConnected && !model.isSilentlyReconnecting) || model.isLoadingHistory)
             }
             AgySearchField(text: $sidebarSearch)
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    AgySessionList(searchText: sidebarSearch) { path in
+                    AgySessionList(searchText: sidebarSearch, onNewInWorkspace: { cwd in
+                        showsSidebar = false
+                        model.newSession(cwd: cwd)
+                    }) { path in
                         showsSidebar = false
                         model.switchSession(path)
                     }
@@ -180,9 +202,9 @@ struct ConversationScreen: View {
         Menu {
             Button("新建会话", systemImage: "square.and.pencil") {
                 focused = false
-                model.newSession()
+                showsWorkspacePicker = true
             }
-            .disabled(!model.isConnected || model.isLoadingHistory)
+            .disabled((!model.isConnected && !model.isSilentlyReconnecting) || model.isLoadingHistory)
             Picker("查看", selection: $tab) {
                 Text("对话").tag(ConversationTab.chat)
                 Text("轨迹").tag(ConversationTab.trace)
@@ -209,6 +231,21 @@ struct ConversationScreen: View {
                     action: { showsPairingReset = true }
                 )
                 .transition(AgyMotion.bannerTransition)
+            } else if model.isSilentlyReconnecting {
+                // 2–3 秒静默重连宽限期内不弹连接失败或重连提示，保持界面无感稳定
+                if let notice = model.pendingDeliveryNotice {
+                    actionBanner(
+                        icon: "clock",
+                        text: notice,
+                        actionTitle: "关闭",
+                        tint: Theme.textSecondary,
+                        action: { model.clearError() }
+                    )
+                    .transition(AgyMotion.bannerTransition)
+                }
+            } else if let gentle = model.gentleReconnectMessage {
+                gentleReconnectBanner(text: gentle)
+                    .transition(AgyMotion.bannerTransition)
             } else if let notice = model.pendingDeliveryNotice {
                 actionBanner(
                     icon: "clock",
@@ -232,7 +269,7 @@ struct ConversationScreen: View {
                         StatusDot(color: Theme.indigo, size: 7, pulsing: true)
                     } else {
                         Image(systemName: "wifi.slash")
-                            .foregroundStyle(Theme.coral)
+                            .foregroundStyle(Theme.amber)
                     }
                     if model.connection == .connecting {
                         AgyShimmerText(text: "正在连接 Mac…", font: .caption.weight(.medium))
@@ -267,6 +304,32 @@ struct ConversationScreen: View {
             }
         }
         .animation(AgyMotion.smooth(reduceMotion), value: bannerStateKey)
+    }
+
+    private func gentleReconnectBanner(text: String) -> some View {
+        HStack(spacing: 9) {
+            StatusDot(color: Theme.amber, size: 7, pulsing: true)
+            Text(text)
+                .appFont(.caption.weight(.medium))
+                .foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button("立即重试") {
+                AgyHaptics.tap()
+                model.reconnect()
+            }
+            .appFont(.caption.weight(.semibold))
+            .foregroundStyle(Theme.indigo)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Theme.cardStroke.opacity(0.6), lineWidth: 0.75)
+        )
+        .padding(.horizontal, 14)
+        .padding(.bottom, 6)
     }
 
     private func actionBanner(icon: String, text: String, actionTitle: String, tint: Color = Theme.coral,
@@ -326,7 +389,15 @@ struct ConversationScreen: View {
                                 .appFont(.subheadline).foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, minHeight: 160)
                         } else if model.connection != .running, model.errorMessage == nil {
-                            EmptyConversationView { prompt in
+                            EmptyConversationView(
+                                workspaceName: model.currentWorkspaceName,
+                                workspaceDisplayPath: model.currentWorkspaceDisplayPath,
+                                canChangeWorkspace: (model.isConnected || model.isSilentlyReconnecting) && !model.isLoadingHistory,
+                                onChooseWorkspace: {
+                                    focused = false
+                                    showsWorkspacePicker = true
+                                }
+                            ) { prompt in
                                 AgyHaptics.selection()
                                 model.draft = prompt
                                 focused = true
@@ -728,6 +799,10 @@ private struct ApprovalCard: View {
 }
 
 private struct EmptyConversationView: View {
+    let workspaceName: String?
+    let workspaceDisplayPath: String?
+    let canChangeWorkspace: Bool
+    let onChooseWorkspace: () -> Void
     let onPrompt: (String) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var appeared = false
@@ -757,6 +832,34 @@ private struct EmptyConversationView: View {
                     .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 20)
+            }
+
+            if let workspaceName, !workspaceName.isEmpty {
+                Button {
+                    AgyHaptics.tap()
+                    onChooseWorkspace()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "folder.fill")
+                            .appFont(.caption2.weight(.semibold))
+                            .foregroundStyle(Theme.indigo)
+                        Text(workspaceDisplayPath ?? workspaceName)
+                            .appFont(.caption.weight(.medium))
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .appFont(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Theme.cardFill, in: Capsule())
+                    .overlay(Capsule().strokeBorder(Theme.cardStroke.opacity(0.65), lineWidth: 0.75))
+                }
+                .buttonStyle(bouncy())
+                .disabled(!canChangeWorkspace)
+                .accessibilityLabel("当前工作区：\(workspaceName)，点按切换工作区")
             }
 
             VStack(spacing: 8) {

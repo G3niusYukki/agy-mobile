@@ -7,6 +7,7 @@ struct SessionsPane: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let onSettings: () -> Void
     @State private var searchText = ""
+    @State private var showsWorkspacePicker = false
     @FocusState private var searchIsFocused: Bool
 
     var body: some View {
@@ -38,6 +39,11 @@ struct SessionsPane: View {
         .toolbarBackground(.hidden, for: .navigationBar)
         .buttonStyle(bouncy())
         .onAppear { model.loadSessions() }
+        .sheet(isPresented: $showsWorkspacePicker) {
+            WorkspacePickerSheet { cwd in
+                model.newSession(cwd: cwd)
+            }
+        }
     }
 
     private func workspace(usesVerticalToolbar: Bool) -> some View {
@@ -69,6 +75,11 @@ struct SessionsPane: View {
                         }
                     }
                     .padding(.bottom, 18)
+                    if let gentle = model.gentleReconnectMessage {
+                        gentleReconnectCard(text: gentle)
+                            .padding(.bottom, 14)
+                            .transition(AgyMotion.bannerTransition)
+                    }
                     if columns {
                         HStack(alignment: .top, spacing: 28) {
                             VStack(alignment: .leading, spacing: 12) {
@@ -100,7 +111,13 @@ struct SessionsPane: View {
         .background(Theme.background())
     }
 
+    private var calmConnectedAppearance: Bool {
+        model.isSilentlyReconnecting && model.hasConnectedOnce
+    }
+
     private var connectionColor: Color {
+        if calmConnectedAppearance { return Theme.success }
+        if model.isReconnectingAfterGrace { return Theme.amber }
         switch model.connection {
         case .paired: return Theme.success
         case .running: return Theme.amber
@@ -111,7 +128,33 @@ struct SessionsPane: View {
     }
 
     private var connectionPulsing: Bool {
-        model.connection == .running || model.connection == .connecting
+        if calmConnectedAppearance { return false }
+        if model.isReconnectingAfterGrace { return true }
+        return model.connection == .running || model.connection == .connecting
+    }
+
+    private func gentleReconnectCard(text: String) -> some View {
+        HStack(spacing: 9) {
+            StatusDot(color: Theme.amber, size: 7, pulsing: true)
+            Text(text)
+                .appFont(.caption.weight(.medium))
+                .foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button("立即重试") {
+                AgyHaptics.tap()
+                model.reconnect()
+            }
+            .appFont(.caption.weight(.semibold))
+            .foregroundStyle(Theme.indigo)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Theme.cardStroke.opacity(0.6), lineWidth: 0.75)
+        )
     }
 
     private func connectionMenu(compactIcon: Bool) -> some View {
@@ -169,11 +212,15 @@ struct SessionsPane: View {
         }
     }
 
+    private var canStartNewSession: Bool {
+        (model.isConnected || calmConnectedAppearance) && !model.isLoadingHistory
+    }
+
     @ViewBuilder private func actionButtons(fullWidth: Bool) -> some View {
         Button {
             AgyHaptics.tap()
             searchIsFocused = false
-            model.newSession()
+            showsWorkspacePicker = true
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "square.and.pencil")
@@ -186,9 +233,9 @@ struct SessionsPane: View {
             .padding(.horizontal, 16)
             .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: 46)
             .background(Theme.accentGradient, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .opacity(!model.isConnected || model.isLoadingHistory ? 0.45 : 1)
+            .opacity(canStartNewSession ? 1 : 0.45)
         }
-        .disabled(!model.isConnected || model.isLoadingHistory)
+        .disabled(!canStartNewSession)
         .accessibilityIdentifier("workspace-new-session")
 
         if hasCurrentSession {
@@ -232,7 +279,10 @@ struct SessionsPane: View {
             Text("最近会话").appFont(.title2.bold()).accessibilityAddTraits(.isHeader)
                 .padding(.bottom, 12)
             if includesSearch { searchField }
-            AgySessionList(searchText: searchText) { path in
+            AgySessionList(searchText: searchText, onNewInWorkspace: { cwd in
+                searchIsFocused = false
+                model.newSession(cwd: cwd)
+            }) { path in
                 searchIsFocused = false
                 model.switchSession(path)
             }
@@ -240,6 +290,10 @@ struct SessionsPane: View {
     }
 
     private var statusText: String {
+        if calmConnectedAppearance { return "已连接" }
+        if model.isReconnectingAfterGrace {
+            return model.reconnectPhase == .gatewayOfflineGentle ? "等待 Mac" : "重连中…"
+        }
         switch model.connection {
         case .paired: return "已连接"
         case .running: return "执行中"
@@ -254,6 +308,7 @@ struct AgySessionList: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let searchText: String
+    var onNewInWorkspace: ((String) -> Void)? = nil
     let open: (String) -> Void
 
     var body: some View {
@@ -277,22 +332,41 @@ struct AgySessionList: View {
     }
 
     private func folderHeader(_ folder: AgySessionFolder) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "folder").accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(folder.name).appFont(.subheadline.weight(.semibold))
-                if let parent = folder.parentPath {
-                    Text(parent).appFont(.caption).foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "folder").accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(folder.name).appFont(.subheadline.weight(.semibold))
+                    if let parent = folder.parentPath {
+                        Text(parent).appFont(.caption).foregroundStyle(.secondary)
+                    }
                 }
+                .fixedSize(horizontal: false, vertical: true)
             }
-            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+
+            if let onNewInWorkspace, !folder.id.isEmpty,
+               (model.isConnected || (model.isSilentlyReconnecting && model.hasConnectedOnce)) {
+                Button {
+                    AgyHaptics.tap()
+                    onNewInWorkspace(folder.id)
+                } label: {
+                    Image(systemName: "plus")
+                        .appFont(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 30, height: 30)
+                        .background(Theme.cardFill, in: Circle())
+                }
+                .buttonStyle(bouncy())
+                .disabled(model.isLoadingHistory)
+                .accessibilityLabel("在 \(folder.name) 新建会话")
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(.secondary)
         .padding(.top, 22)
         .padding(.bottom, 6)
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isHeader)
     }
 
     private func sessionRow(_ entry: AgySessionEntry) -> some View {

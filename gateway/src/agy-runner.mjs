@@ -1,11 +1,17 @@
 import { spawn, execFile } from "node:child_process"
 import { randomBytes } from "node:crypto"
-import { existsSync, mkdirSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
 import { readSessionHistoryStrict } from "./history.mjs"
-import { defaultDataDirs, resolveWorkspaceForSession } from "./session-catalog.mjs"
+import {
+  defaultDataDirs,
+  defaultRecentWorkspacesFile,
+  normalizeWorkspacePath,
+  recordRecentWorkspace,
+  resolveWorkspaceForSession,
+} from "./session-catalog.mjs"
 
 const execFileAsync = promisify(execFile)
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
@@ -65,9 +71,12 @@ function formatToolParameters(params) {
 export class AgyRunner {
   constructor(options = {}) {
     this.agyBin = options.agyBin ?? process.env.AGY_BIN ?? "agy"
-    this.defaultCwd = options.cwd ?? process.env.AGY_CWD ?? process.cwd()
+    this.defaultCwd = normalizeWorkspacePath(options.cwd ?? process.env.AGY_CWD ?? process.cwd()) || process.cwd()
     this.currentCwd = this.defaultCwd
     this.dataDirs = options.dataDirs ?? defaultDataDirs()
+    this.recentWorkspacesFile = options.recentWorkspacesFile === undefined
+      ? defaultRecentWorkspacesFile()
+      : options.recentWorkspacesFile
     this.cliDataDir = options.cliDataDir ?? join(homedir(), ".gemini", "antigravity-cli")
     this.uploadDir = options.uploadDir ?? join(homedir(), ".gemini", "agy-mobile-uploads")
     this.sandbox = options.sandbox ?? (process.env.AGY_SANDBOX === "1")
@@ -152,6 +161,7 @@ export class AgyRunner {
       thinkingLevel: this.thinkingLevel,
       mode: this.mode,
       cwd: this.currentCwd,
+      defaultCwd: this.defaultCwd,
       messageCount: this.conversationId ? undefined : 0,
     }
   }
@@ -196,17 +206,40 @@ export class AgyRunner {
     return this.getState()
   }
 
-  async newSession() {
+  resolveValidWorkspace(rawCwd) {
+    const raw = String(rawCwd ?? "").trim()
+    if (!raw) return null
+    const resolved = normalizeWorkspacePath(raw)
+    if (!resolved || !existsSync(resolved)) {
+      throw new Error(`工作目录不存在：${raw}`)
+    }
+    try {
+      if (!statSync(resolved).isDirectory()) {
+        throw new Error(`工作目录不是文件夹：${raw}`)
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("工作目录")) throw error
+      throw new Error(`无法访问工作目录：${raw}`)
+    }
+    return resolved
+  }
+
+  async newSession(options = {}) {
+    const requested = typeof options === "string" ? options : options?.cwd
+    const targetCwd = requested ? this.resolveValidWorkspace(requested) : this.defaultCwd
     this.stopChild()
     this.conversationId = null
     this.cliConversationId = null
     this.pendingDesktopContextId = null
-    this.currentCwd = this.defaultCwd
+    this.currentCwd = targetCwd
     this.isRunning = false
     this.pendingTurns = 0
     this.activeAssistantSteps.clear()
+    if (requested && targetCwd) {
+      recordRecentWorkspace(targetCwd, this.recentWorkspacesFile)
+    }
     this.onStatus("idle")
-    return { cancelled: false }
+    return { cancelled: false, cwd: this.currentCwd }
   }
 
   async switchSession(sessionPath) {
@@ -230,6 +263,9 @@ export class AgyRunner {
     this.activeAssistantSteps.clear()
     const workspace = await resolveWorkspaceForSession(id, this.dataDirs).catch(() => null)
     this.currentCwd = workspace && existsSync(workspace) ? workspace : this.defaultCwd
+    if (workspace && existsSync(workspace)) {
+      recordRecentWorkspace(workspace, this.recentWorkspacesFile)
+    }
     this.onStatus("idle")
     return { cancelled: false, sessionPath: id, cwd: this.currentCwd }
   }

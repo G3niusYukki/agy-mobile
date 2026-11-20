@@ -36,6 +36,9 @@ struct AgySettingsView: View {
                     .accessibilityIdentifier("settings-model")
                 EffortLevelMenu()
                 AgentModeMenu()
+                if let workspace = model.currentWorkspaceDisplayPath {
+                    LabeledContent("工作区", value: workspace)
+                }
             } header: {
                 Text("Antigravity 会话").appFont(SettingsTypography.section)
             } footer: {
@@ -61,7 +64,7 @@ struct AgySettingsView: View {
                     AgyHaptics.tap()
                     model.reconnect()
                 }
-                .disabled(!model.isPaired || model.connection == .connecting)
+                .disabled(!model.isPaired || (model.connection == .connecting && !model.isReconnectingAfterGrace))
                 .accessibilityIdentifier("settings-reconnect")
             } header: {
                 Text("连接").appFont(SettingsTypography.section)
@@ -135,6 +138,10 @@ struct AgySettingsView: View {
     }
 
     private var connectionTitle: String {
+        if model.isSilentlyReconnecting && model.hasConnectedOnce { return "已连接" }
+        if model.isReconnectingAfterGrace {
+            return model.reconnectPhase == .gatewayOfflineGentle ? "等待 Mac 上线" : "正在重连…"
+        }
         switch model.connection {
         case .idle: return "未连接"
         case .connecting: return "正在连接"
@@ -145,6 +152,8 @@ struct AgySettingsView: View {
     }
 
     private var connectionColor: Color {
+        if model.isSilentlyReconnecting && model.hasConnectedOnce { return Theme.success }
+        if model.isReconnectingAfterGrace { return Theme.amber }
         switch model.connection {
         case .idle: return .secondary
         case .connecting: return Theme.amber

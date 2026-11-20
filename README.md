@@ -11,9 +11,9 @@
 
 ## 核心能力
 
-- **双模连接**：Mac 网关默认开启嵌入式直连服务（自动识别局域网 IP 与 Tailscale `100.x.y.z` IP，零 VPS 即可扫码使用），同时也支持接入自托管公网 Relay。
+- **双模连接与无感重连**：Mac 网关默认开启嵌入式直连服务（自动识别局域网 IP 与 Tailscale `100.x.y.z` IP，零 VPS 即可扫码使用），同时也支持接入自托管公网 Relay；切后台/切网回前台自动重连具备 2.5 秒静默宽限期，不闪烁错误横幅，仅持续失败时温和提示。
 - **Antigravity 原生控制**：直接托管 `agy --input-format stream-json --output-format stream-json`，支持切换全部 `agy models`（Google / Anthropic / OpenAI）、5 档思考强度（`low / medium / high / xhigh / max`）与运行模式（`默认 / 自动编辑 / 规划模式`）。
-- **本地会话目录与历史恢复**：通过 Node 内置 `node:sqlite` 只读扫描 Antigravity `conversation_summaries.db` 与 `transcript_full.jsonl`，支持按工作目录分组检索并切回历史会话。
+- **多工作区与本地会话恢复**：网关自动聚合 Antigravity 历史工作区与本机 Git 项目目录（也支持通过 `AGY_WORKSPACES` 固定常用目录），手机端新建会话时可直接选择对应 `cwd`；通过 Node 内置 `node:sqlite` 只读扫描 `conversation_summaries.db` 与 `transcript_full.jsonl`，支持按工作目录分组检索并无缝续接桌面端与 CLI 会话。
 - **iOS 26 原生体验**：液态玻璃变形输入栏、呼吸思考扫光、语义化工具卡片与折叠态实时日志、Diff 红绿高亮、原生图片 Zoom 预览、触觉反馈、iPhone Duo 折叠屏适配与灵动岛实时活动。
 
 ## 快速开始
